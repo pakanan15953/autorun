@@ -21,3 +21,6 @@ Cookie Run Auto Run.v2-model6-full.yolov8/
 # IDE settings
 .vscode/
 .idea/
+
+# Private Documentation
+tuning_guide.md
