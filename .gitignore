@@ -1,0 +1,23 @@
+# Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# PyTorch/YOLO Model Weights
+*.pt
+runs/
+
+# Captured Screenshots / Temp images
+mumu_bg_capture.png
+mumu_outer_capture.png
+find_hwnd.py
+test_bg_capture.py
+test_bg_input.py
+
+# Downloaded Dataset folders
+Cookie Run Auto Run.v2-model6-full.yolov8/
+
+# IDE settings
+.vscode/
+.idea/
