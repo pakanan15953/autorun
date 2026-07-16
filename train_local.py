@@ -63,7 +63,8 @@ def main():
     print("กด Ctrl+C เพื่อหยุดก่อนกำหนดหากต้องการ\n")
     
     try:
-        model = YOLO("yolov8n.pt")
+        # ใช้โมเดล 'best.pt' ของเดิมที่เราเทรนมาเป็นตัวตั้งต้นในการเรียนรู้เพิ่มเติม (Fine-Tuning)
+        model = YOLO("best.pt")
         # เริ่มการเทรน 50 รอบ ขนาดภาพความละเอียด 640 พิกเซล
         model.train(data=os.path.abspath(yaml_file), epochs=50, imgsz=640)
         
