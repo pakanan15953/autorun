@@ -35,14 +35,12 @@ if not exist ".venv" (
     echo [OK] local environment [.venv] already exists. Skipping creation.
 )
 
+echo [*] Installing and upgrading pip...
+.venv\Scripts\python.exe -m pip install --upgrade pip
 echo.
-echo [*] Activating environment and installing required libraries...
-call .venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-echo.
-echo [*] Downloading and installing dependencies (ultralytics, opencv, pywin32)...
+echo [*] Downloading and installing dependencies (ultralytics, opencv, pywin32, onnxruntime)...
 echo [*] This might take a couple of minutes depending on your internet connection...
-pip install opencv-python numpy pywin32 ultralytics customtkinter
+.venv\Scripts\python.exe -m pip install opencv-python numpy pywin32 ultralytics customtkinter onnxruntime onnx
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Installation failed! Please check your internet connection.

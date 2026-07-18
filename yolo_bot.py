@@ -1,12 +1,32 @@
+import os
+# Limit CPU threads for PyTorch, NumPy, OpenMP, etc.
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
+
 import cv2
 import numpy as np
 import time
 import random
 import ctypes
-import os
 import win32gui
 import win32con
 import win32ui
+import onnxruntime as ort
+
+# Monkeypatch ONNX Runtime to limit threads to 2 and force sequential execution
+_original_InferenceSession = ort.InferenceSession
+def _custom_InferenceSession(path_or_bytes, sess_options=None, *args, **kwargs):
+    if sess_options is None:
+        sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 2
+    sess_options.inter_op_num_threads = 1
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return _original_InferenceSession(path_or_bytes, sess_options, *args, **kwargs)
+ort.InferenceSession = _custom_InferenceSession
+
 from ultralytics import YOLO
 import tkinter as tk
 from PIL import Image, ImageTk
@@ -221,8 +241,8 @@ class CookieRunAIApp(tk.Tk):
         self.template_btn = None
         
         self.trigger_dist = 140
-        self.slide_hold_ms = 810
-        self.conf_val = 0.30
+        self.slide_hold_ms = 850
+        self.conf_val = 0.28
         self.autostart_enabled = True
 
         self.eco_mode_enabled = False
@@ -252,6 +272,10 @@ class CookieRunAIApp(tk.Tk):
         self.last_switch_check_time = 0
         self.last_endgame_check_time = 0
         self.action_cooldown = 0.30
+        self.scheduled_actions = []
+        self.last_jump_time = 0
+        self.last_slide_time = 0
+        self.last_switch_time = 0
         
         # Switch variables
         self.cached_switch_status = False
@@ -305,20 +329,26 @@ class CookieRunAIApp(tk.Tk):
             print("❌ ไม่พบหน้าต่างโปรแกรมจำลอง MuMu Player! กรุณาเปิดโปรแกรมจำลองขึ้นมาก่อนรันบอท")
 
         # 2. Load YOLO model
-        if os.path.exists("best.pt"):
+        if os.path.exists("best.onnx"):
+            print("📥 กำลังโหลดโมเดล YOLOv8 'best.onnx' (ONNX Runtime)...")
+            self.model = YOLO("best.onnx")
+            print("✅ โหลดโมเดล YOLOv8 (ONNX) สำเร็จ! (กินสเปคน้อยลง)")
+        elif os.path.exists("best.pt"):
             print("📥 กำลังโหลดโมเดล YOLOv8 'best.pt'...")
             self.model = YOLO("best.pt")
             print("✅ โหลดโมเดล YOLOv8 สำเร็จ!")
         else:
-            print("❌ ไม่พบโมเดล 'best.pt' ในโฟลเดอร์บอท!")
+            print("❌ ไม่พบโมเดล 'best.onnx' หรือ 'best.pt' ในโฟลเดอร์บอท!")
 
         # 3. Load switch template
-        if os.path.exists("autochangeplayer.png"):
-            self.template_btn = cv2.imread("autochangeplayer.png", cv2.IMREAD_GRAYSCALE)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        switch_template_path = os.path.join(script_dir, "autochangeplayer.png")
+        if os.path.exists(switch_template_path):
+            self.template_btn = cv2.imread(switch_template_path, cv2.IMREAD_GRAYSCALE)
             print("📥 โหลดปุ่มผลัดสองสำรองสำเร็จ!")
 
         # 4. Load autostart templates
-        autostart_dir = "C:/Users/gluee/Desktop/cookierunbot/autostart"
+        autostart_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autostart")
         autostart_files = {
             "ok": "ok_1.png",
             "openall": "openall_2.png",
@@ -501,6 +531,38 @@ class CookieRunAIApp(tk.Tk):
         self.conf_val = float(val)
         self.conf_title.configure(text=f"YOLO Threshold: {int(self.conf_val * 100)}%")
 
+    def schedule_action(self, delay, vk_code, action):
+        """จองคิวการทำงานแบบ Non-blocking ไว้ล่วงหน้า"""
+        self.scheduled_actions.append((time.time() + delay, vk_code, action))
+
+    def process_scheduled_actions(self):
+        """ประมวลผลคำสั่งที่อยู่ในคิวเมื่อถึงเวลา"""
+        if not self.hwnd:
+            return
+        now = time.time()
+        remaining_actions = []
+        # เรียงลำดับคำสั่งตามเวลาที่จะทำก่อน-หลัง
+        self.scheduled_actions.sort(key=lambda x: x[0])
+        for exec_time, vk_code, action in self.scheduled_actions:
+            if now >= exec_time:
+                try:
+                    action()
+                except Exception as e:
+                    print(f"Error running scheduled action: {e}")
+            else:
+                remaining_actions.append((exec_time, vk_code, action))
+        self.scheduled_actions = remaining_actions
+
+    def force_release_key(self, vk_code, scan_code):
+        """บังคับปล่อยปุ่มทันทีเพื่อสลับท่าด่วน (เช่น ยกเลิกการสไลด์เพื่อกระโดด)"""
+        if not self.hwnd:
+            return
+        # ส่งสัญญาณปล่อยปุ่มทันที
+        lParam_up = 1 | (scan_code << 16) | (1 << 30) | (1 << 31)
+        win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, vk_code, lParam_up)
+        # ลบคำสั่งปล่อยปุ่มเดียวกันที่เคยจองไว้ล่วงหน้าเพื่อไม่ให้รันซ้ำซ้อน
+        self.scheduled_actions = [x for x in self.scheduled_actions if x[1] != vk_code]
+
     # --- Frame Rate Limiter Helper ---
     def schedule_next_loop(self, start_time):
         elapsed_ms = int((time.time() - start_time) * 1000)
@@ -533,6 +595,9 @@ class CookieRunAIApp(tk.Tk):
         self.status_label.configure(text="Emulator: CONNECTED", fg="#2ecc71")
         start_time = time.time()
         now = time.time()
+
+        # ประมวลผลปุ่มกดค้างที่ต้องปล่อยแบบ Non-blocking
+        self.process_scheduled_actions()
 
         # Handle RESTING break state
         if self.current_state == self.STATE_RESTING:
@@ -859,10 +924,11 @@ class CookieRunAIApp(tk.Tk):
                 except Exception as e:
                     pass
                 
-                if max_val > 0.75:
+                if max_val > 0.65:
                     self.cached_switch_status = True
                     self.cached_switch_rect = (max_loc, tw, th)
                     self.cached_switch_val = max_val
+                    print(f"[{time.strftime('%H:%M:%S')}] 🔍 ตรวจพบปุ่มผลัดสอง! Match Score: {max_val:.3f} (เกณฑ์: 0.65)")
                 else:
                     self.cached_switch_status = False
 
@@ -947,37 +1013,72 @@ class CookieRunAIApp(tk.Tk):
 
         # Background keyboard control inputs
         current_status = "RUNNING"
-        if now - self.last_action_time > self.action_cooldown:
-            if found_switch:
-                current_status = "SWITCH_COOKIE"
-                print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> เปลี่ยนตัว Alt")
-                human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
-                time.sleep(random.uniform(0.06, 0.10))
-                human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
-                self.last_action_time = time.time()
-            elif found_double_jump_obstacle:
-                current_status = "DOUBLE_JUMP"
-                print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> ดับเบิ้ลจัมพ์")
-                win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, (SCAN_SHIFT << 16) | 1)
-                time.sleep(random.uniform(0.05, 0.08))
-                win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_LSHIFT, (SCAN_SHIFT << 16) | 1 | (1 << 30) | (1 << 31))
-                time.sleep(random.uniform(0.16, 0.22))
-                win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, (SCAN_SHIFT << 16) | 1)
-                time.sleep(random.uniform(0.05, 0.08))
-                win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_LSHIFT, (SCAN_SHIFT << 16) | 1 | (1 << 30) | (1 << 31))
-                self.last_action_time = time.time()
-            elif found_jump_obstacle:
-                current_status = "JUMPING"
-                print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> กระโดด")
-                slide_duration = random.uniform(0.06, 0.10)
-                human_press_bg(self.hwnd, VK_LSHIFT, SCAN_SHIFT, duration_min=slide_duration * 0.95, duration_max=slide_duration * 1.05)
-                self.last_action_time = time.time()
-            elif found_slide_obstacle:
-                current_status = "SLIDING"
-                print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> หมอบสไลด์")
-                slide_duration = self.slide_hold_ms / 1000.0
-                human_press_bg(self.hwnd, VK_SPACE, SCAN_SPACE, duration_min=slide_duration * 0.95, duration_max=slide_duration * 1.05)
-                self.last_action_time = time.time()
+        
+        lParam_shift_down = 1 | (SCAN_SHIFT << 16)
+        lParam_shift_up = 1 | (SCAN_SHIFT << 16) | (1 << 30) | (1 << 31)
+        lParam_space_down = 1 | (SCAN_SPACE << 16)
+        lParam_space_up = 1 | (SCAN_SPACE << 16) | (1 << 30) | (1 << 31)
+        lParam_alt_down = 1 | (SCAN_ALT << 16)
+        lParam_alt_up = 1 | (SCAN_ALT << 16) | (1 << 30) | (1 << 31)
+
+        if found_switch and now - self.last_switch_time > 5.0:
+            current_status = "SWITCH_COOKIE"
+            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> เปลี่ยนตัว Alt")
+            
+            # 1. ส่งสัญญาณคีย์บอร์ด Alt (แบบเดิม)
+            human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
+            time.sleep(random.uniform(0.06, 0.10))
+            human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
+            
+            # 2. ส่งสัญญาณคลิกเมาส์เสมือนตรงไปที่ปุ่มบนจอ
+            if self.cached_switch_rect is not None:
+                max_loc, tw, th = self.cached_switch_rect
+                cx = max_loc[0] + int(tw / 2)
+                cy = max_loc[1] + int(th / 2)
+                print(f"   - ส่งคลิกเมาส์จำลองไปที่พิกัดปุ่มผลัดสอง: ({cx}, {cy})")
+                human_click_bg(self.hwnd, cx, cy, "Relay Switch Button")
+                
+            self.last_switch_time = now
+        
+        elif found_double_jump_obstacle and now - self.last_jump_time > 0.50:
+            current_status = "DOUBLE_JUMP"
+            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> ดับเบิ้ลจัมพ์ (Non-Blocking)")
+            self.force_release_key(VK_SPACE, SCAN_SPACE)
+            
+            win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, lParam_shift_down)
+            r1_shift = random.uniform(0.05, 0.08)
+            self.schedule_action(r1_shift, VK_LSHIFT, lambda lp=lParam_shift_up: win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_LSHIFT, lp))
+            p2_shift = r1_shift + random.uniform(0.16, 0.22)
+            self.schedule_action(p2_shift, VK_LSHIFT, lambda lp=lParam_shift_down: win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, lp))
+            r2_shift = p2_shift + random.uniform(0.05, 0.08)
+            self.schedule_action(r2_shift, VK_LSHIFT, lambda lp=lParam_shift_up: win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_LSHIFT, lp))
+            
+            self.last_jump_time = now
+            self.last_action_time = now
+            
+        elif found_jump_obstacle and now - self.last_jump_time > 0.40:
+            current_status = "JUMPING"
+            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> กระโดด (Non-Blocking)")
+            self.force_release_key(VK_SPACE, SCAN_SPACE)
+            
+            win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, lParam_shift_down)
+            jump_duration = random.uniform(0.06, 0.10)
+            self.schedule_action(jump_duration, VK_LSHIFT, lambda lp=lParam_shift_up: win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_LSHIFT, lp))
+            
+            self.last_jump_time = now
+            self.last_action_time = now
+            
+        elif found_slide_obstacle and now - self.last_slide_time > 0.35:
+            current_status = "SLIDING"
+            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> หมอบสไลด์ (Non-Blocking)")
+            self.force_release_key(VK_LSHIFT, SCAN_SHIFT)
+            
+            win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_SPACE, lParam_space_down)
+            slide_duration = (self.slide_hold_ms / 1000.0) * random.uniform(0.95, 1.05)
+            self.schedule_action(slide_duration, VK_SPACE, lambda lp=lParam_space_up: win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, VK_SPACE, lp))
+            
+            self.last_slide_time = now
+            self.last_action_time = now
 
         # Update bot status UI labels
         if current_status == "RUNNING":
