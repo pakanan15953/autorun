@@ -346,7 +346,7 @@ class GameplayController(tk.Tk):
             # Self-healing: if in PLAYING or WAIT_LOADING state but we see the lobby, reset to WAIT_PLAYLOBBY (only after 6s of no action to prevent transition bugs)
             if (self.current_state == self.STATE_PLAYING or self.current_state == self.STATE_WAIT_LOADING) and (now - self.last_action_time > 6.0):
                 found_lobby_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
-                if found_lobby_btn and (580 <= rx <= 715):
+                if found_lobby_btn and (580 <= rx <= 715) and (380 <= ry <= 420):
                     print(f"[{time.strftime('%H:%M:%S')}] 🔄 ตรวจพบปุ่มหน้าหลัก (Lobby) -> ทำการรีเซ็ตสเตทบอทเป็น WAIT_PLAYLOBBY")
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                     self.gameplay_start_time = 0
