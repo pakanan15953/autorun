@@ -370,13 +370,13 @@ class GameplayController(tk.Tk):
             if self.current_state == self.STATE_WAIT_OK:
                 found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.62)
                 found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
-                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                found_lobby, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
                 
                 if found_openall:
                     self.current_state = self.STATE_WAIT_OPENALL
                 elif found_confirm:
                     self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
-                elif found_lobby and (580 <= rx <= 715):
+                elif found_lobby and (580 <= rx <= 715) and (380 <= ry <= 420):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "ok" in self.autostart_templates:
@@ -395,11 +395,11 @@ class GameplayController(tk.Tk):
 
             elif self.current_state == self.STATE_WAIT_OPENALL:
                 found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
-                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                found_lobby, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
                 
                 if found_confirm:
                     self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
-                elif found_lobby and (580 <= rx <= 715):
+                elif found_lobby and (580 <= rx <= 715) and (380 <= ry <= 420):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "openall" in self.autostart_templates:
@@ -415,8 +415,8 @@ class GameplayController(tk.Tk):
                                 self.last_action_time = now
 
             elif self.current_state == self.STATE_WAIT_CONFIRM_OPENALL:
-                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
-                if found_lobby and (580 <= rx <= 715):
+                found_lobby, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                if found_lobby and (580 <= rx <= 715) and (380 <= ry <= 420):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "confirmafteropenall" in self.autostart_templates:
@@ -434,7 +434,7 @@ class GameplayController(tk.Tk):
             elif self.current_state == self.STATE_WAIT_PLAYLOBBY:
                 if "playlobby" in self.autostart_templates:
                     found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"], threshold=0.70)
-                    if found and (580 <= cx <= 715):
+                    if found and (580 <= cx <= 715) and (380 <= cy <= 420):
                         # รอ 20.0 วินาทีหลังจากเปลี่ยนสเตทมาที่ WAIT_PLAYLOBBY
                         # เพื่อให้เกมรีเฟรชและโหลดหน้าล็อบบี้ให้เสร็จสมบูรณ์ก่อนกด Play
                         if now - self.last_action_time > 15.0:
@@ -601,7 +601,7 @@ class GameplayController(tk.Tk):
                     found_lobby = False
                     found_start = False
                     found_play_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
-                    if found_play_btn and (580 <= rx <= 715):
+                    if found_play_btn and (580 <= rx <= 715) and (380 <= ry <= 420):
                         found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~661)
                     
                     found_relic, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("relic_title", None), threshold=0.75)
