@@ -33,211 +33,15 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 import traceback
 
-# ----------------- Windows Background Input Configuration -----------------
-SCAN_SHIFT = 0x2A
-SCAN_SPACE = 0x39
-SCAN_ALT = 0x38           # Scan code ของปุ่ม Alt
 
-VK_LSHIFT = win32con.VK_LSHIFT
-VK_SPACE = win32con.VK_SPACE
-VK_ALT = win32con.VK_MENU  # ปุ่ม Alt สำหรับเปลี่ยนตัวผลัดสอง
+from window_manager import (
+    find_render_hwnd, human_click_bg, human_press_bg, capture_window_bg,
+    VK_ALT, SCAN_ALT, VK_LSHIFT, SCAN_SHIFT, VK_SPACE, SCAN_SPACE,
+    SCAN_ALT, VK_SPACE, VK_LSHIFT
+)
+from template_matcher import find_template_match
 
-def human_press_bg(hwnd, vk_code, scan_code, duration_min=0.05, duration_max=0.12):
-    """ส่งสัญญาณกดคีย์บอร์ดเสมือนตรงไปที่หน้าต่างเบื้องหลัง (Background Input)"""
-    lParam_down = 1 | (scan_code << 16)
-    lParam_up = 1 | (scan_code << 16) | (1 << 30) | (1 << 31)
-    
-    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, lParam_down)
-    hold_time = random.uniform(duration_min, duration_max)
-    time.sleep(hold_time)
-    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, lParam_up)
-
-def find_render_hwnd(parent_hwnd):
-    """ค้นหาหน้าต่างลูกของ Emulator ที่เป็นหน้าต่างเรนเดอร์/รับอินพุตจริง โดยจัดลำดับความสำคัญของคลาสการแสดงผล"""
-    children = []
-    def cb(hwnd, extra):
-        children.append(hwnd)
-        return True
-    try:
-        win32gui.EnumChildWindows(parent_hwnd, cb, None)
-    except:
-        pass
-        
-    if not children:
-        return parent_hwnd
-        
-    # ลำดับความสำคัญ:
-    # 1. หน้าจอหลักของ MuMu (mumunxdevice) ซึ่งเป็นตัวรับคำสั่งคลิก (Input Handler)
-    for hwnd in children:
-        classname = win32gui.GetClassName(hwnd)
-        title = win32gui.GetWindowText(hwnd)
-        if "mumunxdevice" in title.lower() or "mumunxdevice" in classname.lower():
-            return hwnd
-            
-    # 2. หน้าจอแสดงผล (nemudisplay / nemuwin)
-    for hwnd in children:
-        classname = win32gui.GetClassName(hwnd)
-        title = win32gui.GetWindowText(hwnd)
-        if "nemu" in title.lower() or "nemu" in classname.lower():
-            return hwnd
-            
-    # 3. ตัวเรนเดอร์สำรองอื่นๆ (render / d3d)
-    for hwnd in children:
-        classname = win32gui.GetClassName(hwnd)
-        title = win32gui.GetWindowText(hwnd)
-        if "render" in classname.lower() or "render" in title.lower() or "d3d" in classname.lower():
-            return hwnd
-            
-    # Fallback คืนค่าลูกตัวสุดท้าย
-    return children[-1]
-
-def human_click_bg(hwnd, x_norm, y_norm, click_name=""):
-    """คลิกเมาส์ซ้ายเบื้องหลังจำลองแบบมนุษย์ โดยสเกลพิกัด 800x450 ไปยังพิกัดจริงของหน้าต่างย่อยที่เรนเดอร์เกม"""
-    try:
-        target_hwnd = find_render_hwnd(hwnd)
-        left, top, w_client, h_client = win32gui.GetClientRect(target_hwnd)
-        
-        if w_client <= 0 or h_client <= 0:
-            left_w, top_w, right_w, bot_w = win32gui.GetWindowRect(hwnd)
-            w = right_w - left_w
-            h = bot_w - top_w
-            w_client = w - 16
-            h_client = h - 46
-            target_hwnd = hwnd
-            x_actual = int(8 + x_norm * (w_client / 800.0))
-            y_actual = int(38 + y_norm * (h_client / 450.0))
-        else:
-            x_actual = int(x_norm * (w_client / 800.0))
-            y_actual = int(y_norm * (h_client / 450.0))
-            
-        x_final = x_actual + random.randint(-3, 3)
-        y_final = y_actual + random.randint(-3, 3)
-        x_final = max(0, min(x_final, w_client - 1))
-        y_final = max(0, min(y_final, h_client - 1))
-        
-        lParam = (y_final << 16) | (x_final & 0xFFFF)
-        
-        print(f"🖱️ [Click] '{click_name}' (Target HWND: {target_hwnd}) | สเกล ({x_norm}, {y_norm}) -> พิกัดจริง ({x_final}, {y_final})")
-        
-        win32gui.PostMessage(target_hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
-        time.sleep(random.uniform(0.03, 0.06))
-        win32gui.PostMessage(target_hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
-        time.sleep(random.uniform(0.08, 0.15))
-        win32gui.PostMessage(target_hwnd, win32con.WM_LBUTTONUP, 0, lParam)
-    except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดในการคลิกเมาส์เบื้องหลัง: {e}")
-
-def find_template_match(hwnd, frame, template_img, threshold=0.75):
-    """ค้นหาตำแหน่งรูปภาพต้นแบบในเฟรมหน้าจอ คืนค่า (พบหรือไม่, พิกัด X, พิกัด Y) เทียบกับสเกล 800x450"""
-    if template_img is None or hwnd is None:
-        return False, 0, 0
-    try:
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        res = cv2.matchTemplate(gray_frame, template_img, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-        
-        # แสดงคะแนน Debug สำหรับวิเคราะห์หาปุ่ม
-        h, w = template_img.shape[:2]
-        if (h == 58 and w == 176) or (h == 60 and w == 181):
-            now = time.time()
-            if not hasattr(find_template_match, "last_debug_time"):
-                find_template_match.last_debug_time = 0
-            if now - find_template_match.last_debug_time > 1.5:
-                find_template_match.last_debug_time = now
-                name = "openall" if w == 176 else "confirmafteropenall"
-                print(f"[Debug Match] {name} score: {max_val:.4f} (Threshold: {threshold})")
-        
-        if max_val >= threshold:
-            center_x = max_loc[0] + w // 2
-            center_y = max_loc[1] + h // 2
-            return True, center_x, center_y
-    except Exception as e:
-        pass
-    return False, 0, 0
-
-
-def _printwindow_capture(target_hwnd):
-    """ดึงภาพจาก HWND ด้วย PrintWindow พร้อม try/finally ป้องกัน GDI resource leak ทุกกรณี
-    คืนค่า BGR numpy array หรือ None ถ้าไม่สำเร็จ"""
-    left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
-    w = right - left
-    h = bot - top
-
-    if w <= 50 or h <= 50:
-        return None
-
-    hwndDC = None
-    mfcDC = None
-    saveDC = None
-    saveBitMap = None
-
-    try:
-        hwndDC = win32gui.GetWindowDC(target_hwnd)
-        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-        saveDC = mfcDC.CreateCompatibleDC()
-        saveBitMap = win32ui.CreateBitmap()
-        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
-        saveDC.SelectObject(saveBitMap)
-
-        result = ctypes.windll.user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 3)
-
-        if result != 1:
-            return None
-
-        bmpinfo = saveBitMap.GetInfo()
-        bmpstr = saveBitMap.GetBitmapBits(True)
-        img = np.frombuffer(bmpstr, dtype='uint8')
-        img.shape = (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)
-
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    except Exception:
-        return None
-    finally:
-        # Cleanup GDI resources ไม่ว่าจะสำเร็จหรือ error — ป้องกัน memory leak
-        try:
-            if saveBitMap is not None:
-                win32gui.DeleteObject(saveBitMap.GetHandle())
-        except Exception:
-            pass
-        try:
-            if saveDC is not None:
-                saveDC.DeleteDC()
-        except Exception:
-            pass
-        try:
-            if mfcDC is not None:
-                mfcDC.DeleteDC()
-        except Exception:
-            pass
-        try:
-            if hwndDC is not None:
-                win32gui.ReleaseDC(target_hwnd, hwndDC)
-        except Exception:
-            pass
-
-def capture_window_bg(hwnd):
-    """ดึงภาพสกรีนช็อกจากวินโดวส์เป้าหมายเบื้องหลัง แม้จะมีหน้าต่างอื่นบังอยู่ โดยจับที่หน้าต่างย่อยก่อน ถ้าไม่ได้ค่อยครอปหน้าต่างหลัก"""
-    try:
-        # ค้นหาหน้าต่างย่อยที่เป็นตัวเรนเดอร์เกมจริง
-        target_hwnd = find_render_hwnd(hwnd)
-
-        # 1. พยายามดึงภาพจากหน้าต่างย่อยโดยตรง (ไม่มีขอบ/ไตเติลบาร์)
-        img_bgr = _printwindow_capture(target_hwnd)
-        if img_bgr is not None and np.mean(img_bgr) > 5.0:
-            return cv2.resize(img_bgr, (800, 450))
-
-        # 2. ถ้าดึงจากหน้าต่างย่อยไม่สำเร็จ ให้ย้อนกลับไปดึงจากหน้าต่างหลักแล้วครอปตัดขอบ (Fallback)
-        img_bgr = _printwindow_capture(hwnd)
-        if img_bgr is not None:
-            if img_bgr.shape[0] > 50 and img_bgr.shape[1] > 50:
-                cropped = img_bgr[38:-8, 8:-8]
-                return cv2.resize(cropped, (800, 450))
-            return cv2.resize(img_bgr, (800, 450))
-    except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดในการดึงภาพเบื้องหลัง: {e}")
-    return None
-
-class CookieRunAIApp(tk.Tk):
+class GameplayController(tk.Tk):
     def __init__(self):
         super().__init__()
         
@@ -322,13 +126,10 @@ class CookieRunAIApp(tk.Tk):
         self.init_resources()
         
         # Construct UI elements
-        self.create_layout()
         
         # Bind closing protocol
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Start cooperative loop
-        self.after(100, self.update_loop)
 
     def init_resources(self):
         print("=== บอท Cookie Run (โหมด Dashboard GUI) กำลังเตรียมทรัพยากร ===")
@@ -419,7 +220,9 @@ class CookieRunAIApp(tk.Tk):
             "selectbuff_3": "selectbuff_3.png",
             "affterselectbuff": "affterselectbuff_1.png",
             "confirmlevelup": "confirmlevelup1.png",
-            "boost_start_btn": "boost_start_btn.png"
+            "boost_start_btn": "boost_start_btn.png",
+            "relic_title": "relic_title.png",
+            "relic_claim": "relic_claim.png"
         }
         
         print("📥 เริ่มต้นโหลดปุ่มสำหรับ Autostart...")
@@ -440,336 +243,6 @@ class CookieRunAIApp(tk.Tk):
                     
                     self.autostart_templates[name] = img
         print("✅ โหลดปุ่ม Autostart ทั้งหมดสำเร็จ!")
-
-    def create_layout(self):
-        # === Color Palette (GitHub Dark Inspired) ===
-        self.C_BG = "#0d1117"        # Window background
-        self.C_CARD = "#161b22"      # Card/section background
-        self.C_BORDER = "#30363d"    # Borders and dividers
-        self.C_TEXT = "#e6edf3"      # Primary text
-        self.C_TEXT2 = "#8b949e"     # Secondary text
-        self.C_ACCENT = "#58a6ff"    # Accent blue
-        self.C_GREEN = "#3fb950"     # Success green
-        self.C_RED = "#f85149"       # Error red
-        self.C_YELLOW = "#d29922"    # Warning yellow
-        self.C_PURPLE = "#bc8cff"    # Purple accent
-        self.C_TROUGH = "#21262d"    # Slider trough
-
-        self.configure(bg=self.C_BG)
-        self.geometry("370x640")
-
-        # Scrollable main container
-        main = tk.Frame(self, bg=self.C_BG)
-        main.pack(fill="both", expand=True, padx=12, pady=10)
-
-        # ─── HEADER ───
-        header = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        header.pack(fill="x", pady=(0, 8))
-
-        tk.Label(header, text="🍪", font=("Segoe UI Emoji", 20), bg=self.C_CARD).pack(side="left", padx=(12, 4), pady=8)
-        title_frame = tk.Frame(header, bg=self.C_CARD)
-        title_frame.pack(side="left", fill="x", expand=True, pady=8)
-        tk.Label(title_frame, text="Cookie Run AI Bot", font=("Segoe UI", 14, "bold"), fg=self.C_TEXT, bg=self.C_CARD).pack(anchor="w")
-
-        status_text = "● Connected" if self.hwnd else "● Disconnected"
-        status_color = self.C_GREEN if self.hwnd else self.C_RED
-        self.status_label = tk.Label(title_frame, text=status_text, font=("Segoe UI", 9), fg=status_color, bg=self.C_CARD)
-        self.status_label.pack(anchor="w")
-
-        # ─── PROFILE CARD ───
-        profile_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        profile_card.pack(fill="x", pady=(0, 6))
-        profile_inner = tk.Frame(profile_card, bg=self.C_CARD)
-        profile_inner.pack(fill="x", padx=12, pady=8)
-
-        tk.Label(profile_inner, text="▸ Farm Profile", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
-
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Dark.TCombobox", fieldbackground=self.C_TROUGH, background=self.C_CARD, foreground=self.C_TEXT, arrowcolor=self.C_TEXT, borderwidth=0)
-
-        self.profile_combo = ttk.Combobox(
-            profile_inner,
-            values=["Stage 1 (ฟาร์มเงิน/เหรียญ)", "Stage 3 (วิ่งทำระยะ)", "Stage 6 (Auto Run / ฟาร์มกล่อง AFK)", "Stage 7 (Pure AFK / วิ่งอัตโนมัติไม่กดปุ่ม)"],
-            state="readonly", font=("Segoe UI", 9), style="Dark.TCombobox"
-        )
-        self.profile_combo.set("Stage 1 (ฟาร์มเงิน/เหรียญ)")
-        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
-        self.profile_combo.pack(fill="x")
-
-        # ─── FEATURES CARD ───
-        feat_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        feat_card.pack(fill="x", pady=(0, 6))
-        feat_inner = tk.Frame(feat_card, bg=self.C_CARD)
-        feat_inner.pack(fill="x", padx=12, pady=8)
-
-        tk.Label(feat_inner, text="▸ Features", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
-
-        # Tkinter variables for Checkbuttons
-        self.autostart_var = tk.IntVar(value=1 if self.autostart_enabled else 0)
-        self.rest_var = tk.IntVar(value=1 if self.rest_breaks_enabled else 0)
-        self.eco_var = tk.IntVar(value=1 if self.eco_mode_enabled else 0)
-        self.boost_start_var = tk.IntVar(value=0)
-        self.buy_random_boost_var = tk.IntVar(value=1 if self.buy_random_boost else 0)
-        self.use_relay_var = tk.IntVar(value=1 if self.use_relay else 0)
-
-        toggle_opts = dict(
-            font=("Segoe UI", 9), bg=self.C_CARD, fg=self.C_TEXT,
-            selectcolor=self.C_TROUGH, activebackground=self.C_CARD,
-            activeforeground=self.C_TEXT, bd=0, highlightthickness=0, anchor="w"
-        )
-
-        toggles = [
-            ("Auto Start Game", self.autostart_var, self.on_toggle_autostart),
-            ("Auto-Rest Breaks", self.rest_var, self.on_toggle_rest),
-            ("Eco Mode (20 FPS)", self.eco_var, self.on_toggle_eco),
-            ("Boost Start (Stage 3)", self.boost_start_var, self.on_toggle_boost_start),
-            ("Buy Random Boost", self.buy_random_boost_var, self.on_toggle_buy_random_boost),
-            ("Use Relay Cookie (ผลัดสอง)", self.use_relay_var, self.on_toggle_relay),
-        ]
-        for text, var, cmd in toggles:
-            tk.Checkbutton(feat_inner, text=text, variable=var, command=cmd, **toggle_opts).pack(fill="x", pady=1)
-
-        # ─── SESSION CARD ───
-        sess_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        sess_card.pack(fill="x", pady=(0, 6))
-        sess_inner = tk.Frame(sess_card, bg=self.C_CARD)
-        sess_inner.pack(fill="x", padx=12, pady=8)
-
-        sess_header = tk.Frame(sess_inner, bg=self.C_CARD)
-        sess_header.pack(fill="x", pady=(0, 5))
-        tk.Label(sess_header, text="▸ Session", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(side="left")
-        self.session_runs_label = tk.Label(sess_header, text=f"{self.current_session_runs}/{self.target_session_runs} games", font=("Segoe UI", 9, "bold"), fg=self.C_PURPLE, bg=self.C_CARD)
-        self.session_runs_label.pack(side="right")
-
-        # Canvas Progress Bar
-        self.progress_canvas = tk.Canvas(sess_inner, height=8, bg=self.C_TROUGH, highlightthickness=0, bd=0)
-        self.progress_canvas.pack(fill="x", pady=(0, 2))
-        self.progress_bar_id = self.progress_canvas.create_rectangle(0, 0, 0, 8, fill=self.C_PURPLE, outline="")
-        self._update_progress_bar()
-
-        # ─── TUNING CARD ───
-        tune_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        tune_card.pack(fill="x", pady=(0, 6))
-        tune_inner = tk.Frame(tune_card, bg=self.C_CARD)
-        tune_inner.pack(fill="x", padx=12, pady=8)
-
-        tk.Label(tune_inner, text="▸ Tuning", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
-
-        slider_opts = dict(
-            orient=tk.HORIZONTAL, bg=self.C_CARD, fg=self.C_TEXT,
-            troughcolor=self.C_TROUGH, activebackground=self.C_ACCENT,
-            bd=0, highlightthickness=0, showvalue=False, sliderrelief="flat"
-        )
-
-        # Slider: Max Games/Session
-        self.session_limit_title = tk.Label(tune_inner, text=f"Max Games/Session: {self.max_session_runs_limit}", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.session_limit_title.pack(anchor="w")
-        self.session_limit_slider = tk.Scale(tune_inner, from_=5, to=30, command=self.on_session_limit_change, **slider_opts)
-        self.session_limit_slider.set(self.max_session_runs_limit)
-        self.session_limit_slider.pack(fill="x", pady=(0, 4))
-
-        # Slider: Trigger Distance
-        self.dist_title = tk.Label(tune_inner, text=f"Trigger Distance: {self.trigger_dist} px", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.dist_title.pack(anchor="w")
-        self.dist_slider = tk.Scale(tune_inner, from_=50, to=300, command=self.on_dist_change, **slider_opts)
-        self.dist_slider.set(self.trigger_dist)
-        self.dist_slider.pack(fill="x", pady=(0, 4))
-
-        # Slider: Slide Hold
-        self.slide_title = tk.Label(tune_inner, text=f"Slide Hold: {self.slide_hold_ms} ms", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.slide_title.pack(anchor="w")
-        self.slide_slider = tk.Scale(tune_inner, from_=100, to=1500, command=self.on_slide_change, **slider_opts)
-        self.slide_slider.set(self.slide_hold_ms)
-        self.slide_slider.pack(fill="x", pady=(0, 4))
-
-        # Slider: YOLO Confidence
-        self.conf_title = tk.Label(tune_inner, text=f"YOLO Threshold: {int(self.conf_val * 100)}%", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.conf_title.pack(anchor="w")
-        self.conf_slider = tk.Scale(tune_inner, from_=0.10, to=0.85, resolution=0.01, command=self.on_conf_change, **slider_opts)
-        self.conf_slider.set(self.conf_val)
-        self.conf_slider.pack(fill="x", pady=(0, 4))
-
-        # Slider: AFK Run Time (Stage 6)
-        m = self.afk_delay_sec // 60
-        s = self.afk_delay_sec % 60
-        self.afk_delay_title = tk.Label(tune_inner, text=f"AFK Run Time: {self.afk_delay_sec}s ({m}:{s:02d})", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.afk_delay_title.pack(anchor="w")
-        self.afk_delay_slider = tk.Scale(tune_inner, from_=10, to=300, command=self.on_afk_delay_change, **slider_opts)
-        self.afk_delay_slider.set(self.afk_delay_sec)
-        self.afk_delay_slider.pack(fill="x")
-
-        # ─── LIVE STATS CARD ───
-        stats_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        stats_card.pack(fill="x", pady=(0, 6))
-        stats_inner = tk.Frame(stats_card, bg=self.C_CARD)
-        stats_inner.pack(fill="x", padx=12, pady=6)
-
-        tk.Label(stats_inner, text="▸ Live Stats", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 2))
-        self.speed_label = tk.Label(stats_inner, text="Speed: --- px/s  |  TTC: ---s", font=("Consolas", 9), fg=self.C_TEXT2, bg=self.C_CARD)
-        self.speed_label.pack(anchor="w")
-
-        # ─── STATUS BAR ───
-        status_bar = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
-        status_bar.pack(fill="x")
-        self.bot_status_label = tk.Label(status_bar, text="STATUS: RUNNING", font=("Segoe UI", 12, "bold"), fg=self.C_GREEN, bg=self.C_CARD)
-        self.bot_status_label.pack(pady=10)
-
-    def _update_progress_bar(self):
-        """อัปเดต Canvas progress bar ตามจำนวนรอบที่เล่น"""
-        self.progress_canvas.update_idletasks()
-        canvas_w = self.progress_canvas.winfo_width()
-        if canvas_w <= 1:
-            canvas_w = 300  # fallback ก่อน widget render
-        if self.target_session_runs > 0:
-            ratio = min(self.current_session_runs / self.target_session_runs, 1.0)
-        else:
-            ratio = 0
-        fill_w = int(canvas_w * ratio)
-        self.progress_canvas.coords(self.progress_bar_id, 0, 0, fill_w, 8)
-        
-
-
-    def on_profile_change(self, event=None):
-        selected = self.profile_combo.get()
-        print(f"⚙️ Profile Changed: {selected}")
-        
-        if "Stage 1" in selected:
-            # Stage 1 Settings
-            self.buy_random_boost_var.set(1)
-            self.boost_start_var.set(0)
-            self.use_relay_var.set(1)
-            
-            self.buy_random_boost = True
-            self.use_boost_start = False
-            self.use_relay = True
-            self.no_action_mode = False
-            self.afk_delay_sec = 0
-            
-            self.trigger_dist = 130
-            self.dist_slider.set(130)
-            self.dist_title.configure(text="Trigger Distance: 130 px")
-            
-            print("   - Auto-configured for Stage 1: Buy Buff=ON, Boost Start=OFF, Relay=ON, Trigger Dist=130px")
-        elif "Stage 3" in selected:
-            # Stage 3 Settings
-            self.buy_random_boost_var.set(0)
-            self.boost_start_var.set(1)
-            self.use_relay_var.set(0)
-            
-            self.buy_random_boost = False
-            self.use_boost_start = True
-            self.use_relay = False
-            self.no_action_mode = False
-            self.afk_delay_sec = 0
-            
-            self.trigger_dist = 165
-            self.dist_slider.set(165)
-            self.dist_title.configure(text="Trigger Distance: 165 px")
-            
-            print("   - Auto-configured for Stage 3: Buy Buff=OFF, Boost Start=ON, Relay=OFF, Trigger Dist=165px")
-        elif "Stage 6" in selected:
-            # Stage 6 Settings (AFK Auto Run - No jump/slide for 2:05 mins, then normal play)
-            self.buy_random_boost_var.set(0)
-            self.boost_start_var.set(0)
-            self.use_relay_var.set(0)
-            
-            self.buy_random_boost = False
-            self.use_boost_start = False
-            self.use_relay = False
-            self.no_action_mode = True
-            self.afk_delay_sec = 125
-            
-            if hasattr(self, "afk_delay_slider"):
-                self.afk_delay_slider.set(125)
-                m = 125 // 60
-                s = 125 % 60
-                self.afk_delay_title.configure(text=f"AFK Run Time: 125s ({m}:{s:02d})")
-            
-            print("   - Auto-configured for Stage 6: AFK Auto Run (125s AFK -> Normal Dodge, Auto Restart=ON)")
-        elif "Stage 7" in selected:
-            # Stage 7 Settings (Pure AFK - No actions at all, just restart loop)
-            self.buy_random_boost_var.set(0)
-            self.boost_start_var.set(0)
-            self.use_relay_var.set(0)
-            
-            self.buy_random_boost = False
-            self.use_boost_start = False
-            self.use_relay = False
-            self.no_action_mode = True
-            self.afk_delay_sec = 999999
-            
-            if hasattr(self, "afk_delay_slider"):
-                self.afk_delay_slider.set(300)
-                self.afk_delay_title.configure(text="AFK Run Time: Infinite (Pure AFK)")
-            
-            print("   - Auto-configured for Stage 7: Pure AFK (No Jump/Slide, Auto Restart=ON)")
-            
-        self.update_session_label()
-
-    # --- UI Callbacks ---
-    def on_toggle_autostart(self):
-        self.autostart_enabled = self.autostart_var.get() == 1
-        print(f"⚙️ Auto Start Toggled: {self.autostart_enabled}")
-
-    def update_session_label(self):
-        if self.rest_breaks_enabled:
-            if self.current_state == self.STATE_RESTING:
-                self.session_runs_label.configure(text=f"{self.current_session_runs}/{self.target_session_runs} (Resting)")
-            else:
-                self.session_runs_label.configure(text=f"{self.current_session_runs}/{self.target_session_runs} games")
-        else:
-            self.session_runs_label.configure(text=f"{self.current_session_runs} games (No Rest)")
-        self._update_progress_bar()
-
-    def on_toggle_rest(self):
-        self.rest_breaks_enabled = self.rest_var.get() == 1
-        print(f"⚙️ Auto-Rest Breaks Toggled: {self.rest_breaks_enabled}")
-        self.update_session_label()
-
-    def on_toggle_eco(self):
-        self.eco_mode_enabled = self.eco_var.get() == 1
-        print(f"⚙️ Eco Mode Toggled: {self.eco_mode_enabled}")
-
-    def on_toggle_boost_start(self):
-        self.use_boost_start = self.boost_start_var.get() == 1
-        print(f"⚙️ Boost Start Clicker Toggled: {self.use_boost_start}")
-
-    def on_toggle_buy_random_boost(self):
-        self.buy_random_boost = self.buy_random_boost_var.get() == 1
-        print(f"⚙️ Buy Random Boost Toggled: {self.buy_random_boost}")
-
-    def on_toggle_relay(self):
-        self.use_relay = self.use_relay_var.get() == 1
-        print(f"⚙️ Use Relay Toggled: {self.use_relay}")
-
-    def on_session_limit_change(self, val):
-        self.max_session_runs_limit = int(val)
-        self.session_limit_title.configure(text=f"Max Games/Session: {self.max_session_runs_limit} runs")
-        
-        # ปรับจูนค่าเป้าหมายปัจจุบันให้เหมาะสมกับลิมิตใหม่ทันทีหากมันมากเกินไป
-        if self.target_session_runs > self.max_session_runs_limit:
-            self.target_session_runs = self.max_session_runs_limit
-            self.update_session_label()
-
-    def on_dist_change(self, val):
-        self.trigger_dist = int(val)
-        self.dist_title.configure(text=f"Trigger Distance: {self.trigger_dist} px")
-
-    def on_slide_change(self, val):
-        self.slide_hold_ms = int(val)
-        self.slide_title.configure(text=f"Slide Hold: {self.slide_hold_ms} ms")
-
-    def on_conf_change(self, val):
-        self.conf_val = float(val)
-        self.conf_title.configure(text=f"YOLO Threshold: {int(self.conf_val * 100)}%")
-
-    def on_afk_delay_change(self, val):
-        self.afk_delay_sec = int(val)
-        m = self.afk_delay_sec // 60
-        s = self.afk_delay_sec % 60
-        self.afk_delay_title.configure(text=f"AFK Run Time: {self.afk_delay_sec}s ({m}:{s:02d})")
-
     def schedule_action(self, delay, vk_code, action):
         """จองคิวการทำงานแบบ Non-blocking ไว้ล่วงหน้า"""
         self.scheduled_actions.append((time.time() + delay, vk_code, action))
@@ -962,9 +435,9 @@ class CookieRunAIApp(tk.Tk):
                 if "playlobby" in self.autostart_templates:
                     found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"], threshold=0.70)
                     if found and (580 <= cx <= 715):
-                        # รอ 3.0 วินาทีหลังจากเปลี่ยนสเตทมาที่ WAIT_PLAYLOBBY
+                        # รอ 20.0 วินาทีหลังจากเปลี่ยนสเตทมาที่ WAIT_PLAYLOBBY
                         # เพื่อให้เกมรีเฟรชและโหลดหน้าล็อบบี้ให้เสร็จสมบูรณ์ก่อนกด Play
-                        if now - self.last_action_time > 3.0:
+                        if now - self.last_action_time > 15.0:
                             print(f"[{time.strftime('%H:%M:%S')}] 🖱️ คลิกปุ่ม Play ล็อบบี้ด้วยพิกัดแสกน ({cx}, {cy})")
                             human_click_bg(self.hwnd, cx, cy, "Play Lobby Button")
                             self.last_action_time = now
@@ -1134,6 +607,22 @@ class CookieRunAIApp(tk.Tk):
                         elif 580 <= rx <= 715:
                             found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~597)
                     
+                    found_relic, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("relic_title", None), threshold=0.75)
+                    if found_relic:
+                        found_claim, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates.get("relic_claim", None), threshold=0.70)
+                        if found_claim:
+                            if now - self.last_action_time > 1.2:
+                                print(f"[{time.strftime('%H:%M:%S')}] 🏆 พบป๊อปอัป Relic -> คลิกปุ่ม Claim เพื่อกดรับ ({cx}, {cy})")
+                                human_click_bg(self.hwnd, cx, cy, "Claim Relic Button")
+                                self.last_action_time = now
+                        else:
+                            if now - self.last_action_time > 3.0:
+                                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ ไม่พบปุ่ม Claim บนป๊อปอัป Relic -> คลิกพิกัดสำรอง (500, 360)")
+                                human_click_bg(self.hwnd, 500, 360, "Claim Relic Button (Fallback)")
+                                self.last_action_time = now
+                        self.schedule_next_loop(start_time)
+                        return
+
                     found_buff1, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("selectbuff_1", None), threshold=0.75)
                     
                     if found_openall:
@@ -1628,10 +1117,3 @@ class CookieRunAIApp(tk.Tk):
         self.schedule_next_loop(start_time)
 
 
-    def on_closing(self):
-        self.destroy()
-        print("=== ปิดการทำงานบอทเรียบร้อย ===")
-
-if __name__ == "__main__":
-    app = CookieRunAIApp()
-    app.mainloop()
