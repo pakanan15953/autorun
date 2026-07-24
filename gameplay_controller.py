@@ -597,15 +597,12 @@ class GameplayController(tk.Tk):
                     found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.62)
                     found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
                     
-                    # ใช้ปุ่ม playlobby ร่วมกันในการระบุหน้าจอเพื่อความเสถียร (แยกหน้าระหว่าง Lobby กับ หน้าเตรียมตัว ด้วยพิกัด X ของจุดกึ่งกลาง)
+                    # ใช้ปุ่ม playlobby ในการระบุหน้าจอล็อบบี้โดยอ้างอิงช่วงพิกัด X
                     found_lobby = False
                     found_start = False
                     found_play_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
-                    if found_play_btn:
-                        if rx < 580:
-                            found_start = True  # อยู่หน้าเตรียมตัวเริ่มวิ่ง (Center X ~562)
-                        elif 580 <= rx <= 715:
-                            found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~597)
+                    if found_play_btn and (580 <= rx <= 715):
+                        found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~661)
                     
                     found_relic, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("relic_title", None), threshold=0.75)
                     if found_relic:
