@@ -622,24 +622,24 @@ class GameplayController(tk.Tk):
 
                     found_buff1, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("selectbuff_1", None), threshold=0.75)
                     
-                    if found_openall:
+                    if found_openall and self.current_state != self.STATE_WAIT_OPENALL:
                         print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกล่องรางวัล (Open All) -> สลับสเตทเป็น WAIT_OPENALL")
                         self.current_state = self.STATE_WAIT_OPENALL
                         self.schedule_next_loop(start_time)
                         return
-                    elif found_confirm:
+                    elif found_confirm and self.current_state != self.STATE_WAIT_CONFIRM_OPENALL:
                         print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกดรับรางวัล (Confirm) -> สลับสเตทเป็น WAIT_CONFIRM_OPENALL")
                         self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
                         self.schedule_next_loop(start_time)
                         return
-                    elif found_lobby and not _transitioning:
+                    elif found_lobby and self.current_state != self.STATE_WAIT_PLAYLOBBY and not _transitioning:
                         # ป้องกันการวนซ้ำกดปุ่ม Play ล็อบบี้ระหว่างที่หน้าจอกำลังเปลี่ยนผ่านอยู่
                         print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าล็อบบี้ (Play Lobby) -> สลับสเตทเป็น WAIT_PLAYLOBBY")
                         self.current_state = self.STATE_WAIT_PLAYLOBBY
                         self.last_action_time = 0
                         self.schedule_next_loop(start_time)
                         return
-                    elif found_buff1 or found_start:
+                    elif (found_buff1 or found_start) and self.current_state not in (self.STATE_WAIT_SELECTBUFF_1, self.STATE_WAIT_START):
                         if not _transitioning:
                             if self.buy_random_boost:
                                 print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอซื้อบัฟ/เตรียมเริ่มเกม -> สลับสเตทเป็น WAIT_SELECTBUFF_1")
