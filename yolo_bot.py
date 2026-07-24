@@ -53,41 +53,43 @@ def human_press_bg(hwnd, vk_code, scan_code, duration_min=0.05, duration_max=0.1
     win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, lParam_up)
 
 def find_render_hwnd(parent_hwnd):
-    """ค้นหาหน้าต่างลูกของ Emulator ที่เป็นหน้าต่างเรนเดอร์/รับอินพุตจริง"""
-    render_hwnd = [parent_hwnd]
-    
+    """ค้นหาหน้าต่างลูกของ Emulator ที่เป็นหน้าต่างเรนเดอร์/รับอินพุตจริง โดยจัดลำดับความสำคัญของคลาสการแสดงผล"""
+    children = []
     def cb(hwnd, extra):
-        classname = win32gui.GetClassName(hwnd)
-        title = win32gui.GetWindowText(hwnd)
-        
-        # ค้นหาเป้าหมายหลักที่มีคำว่า mumunxdevice (เช่นหน้าต่างหลักคันวาส MuMuNxDevice)
-        if "mumunxdevice" in title.lower() or "mumunxdevice" in classname.lower():
-            render_hwnd[0] = hwnd
-            return False
-            
-        # สำรองเผื่อกรณีเป็นตัวจำลองคลาสอื่นที่มีคำว่า render หรือ d3d
-        if "render" in classname.lower() or "render" in title.lower() or "d3d" in classname.lower():
-            render_hwnd[0] = hwnd
+        children.append(hwnd)
         return True
-        
     try:
         win32gui.EnumChildWindows(parent_hwnd, cb, None)
     except:
         pass
         
-    if render_hwnd[0] == parent_hwnd:
-        children = []
-        def cb2(hwnd, extra):
-            children.append(hwnd)
-            return True
-        try:
-            win32gui.EnumChildWindows(parent_hwnd, cb2, None)
-            if children:
-                render_hwnd[0] = children[-1]
-        except:
-            pass
+    if not children:
+        return parent_hwnd
+        
+    # ลำดับความสำคัญ:
+    # 1. หน้าจอหลักของ MuMu (mumunxdevice) ซึ่งเป็นตัวรับคำสั่งคลิก (Input Handler)
+    for hwnd in children:
+        classname = win32gui.GetClassName(hwnd)
+        title = win32gui.GetWindowText(hwnd)
+        if "mumunxdevice" in title.lower() or "mumunxdevice" in classname.lower():
+            return hwnd
             
-    return render_hwnd[0]
+    # 2. หน้าจอแสดงผล (nemudisplay / nemuwin)
+    for hwnd in children:
+        classname = win32gui.GetClassName(hwnd)
+        title = win32gui.GetWindowText(hwnd)
+        if "nemu" in title.lower() or "nemu" in classname.lower():
+            return hwnd
+            
+    # 3. ตัวเรนเดอร์สำรองอื่นๆ (render / d3d)
+    for hwnd in children:
+        classname = win32gui.GetClassName(hwnd)
+        title = win32gui.GetWindowText(hwnd)
+        if "render" in classname.lower() or "render" in title.lower() or "d3d" in classname.lower():
+            return hwnd
+            
+    # Fallback คืนค่าลูกตัวสุดท้าย
+    return children[-1]
 
 def human_click_bg(hwnd, x_norm, y_norm, click_name=""):
     """คลิกเมาส์ซ้ายเบื้องหลังจำลองแบบมนุษย์ โดยสเกลพิกัด 800x450 ไปยังพิกัดจริงของหน้าต่างย่อยที่เรนเดอร์เกม"""
@@ -154,71 +156,79 @@ def find_template_match(hwnd, frame, template_img, threshold=0.75):
     return False, 0, 0
 
 
+def _printwindow_capture(target_hwnd):
+    """ดึงภาพจาก HWND ด้วย PrintWindow พร้อม try/finally ป้องกัน GDI resource leak ทุกกรณี
+    คืนค่า BGR numpy array หรือ None ถ้าไม่สำเร็จ"""
+    left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
+    w = right - left
+    h = bot - top
+
+    if w <= 50 or h <= 50:
+        return None
+
+    hwndDC = None
+    mfcDC = None
+    saveDC = None
+    saveBitMap = None
+
+    try:
+        hwndDC = win32gui.GetWindowDC(target_hwnd)
+        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+        saveDC = mfcDC.CreateCompatibleDC()
+        saveBitMap = win32ui.CreateBitmap()
+        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+        saveDC.SelectObject(saveBitMap)
+
+        result = ctypes.windll.user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 3)
+
+        if result != 1:
+            return None
+
+        bmpinfo = saveBitMap.GetInfo()
+        bmpstr = saveBitMap.GetBitmapBits(True)
+        img = np.frombuffer(bmpstr, dtype='uint8')
+        img.shape = (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)
+
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    except Exception:
+        return None
+    finally:
+        # Cleanup GDI resources ไม่ว่าจะสำเร็จหรือ error — ป้องกัน memory leak
+        try:
+            if saveBitMap is not None:
+                win32gui.DeleteObject(saveBitMap.GetHandle())
+        except Exception:
+            pass
+        try:
+            if saveDC is not None:
+                saveDC.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if mfcDC is not None:
+                mfcDC.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if hwndDC is not None:
+                win32gui.ReleaseDC(target_hwnd, hwndDC)
+        except Exception:
+            pass
+
 def capture_window_bg(hwnd):
     """ดึงภาพสกรีนช็อกจากวินโดวส์เป้าหมายเบื้องหลัง แม้จะมีหน้าต่างอื่นบังอยู่ โดยจับที่หน้าต่างย่อยก่อน ถ้าไม่ได้ค่อยครอปหน้าต่างหลัก"""
     try:
         # ค้นหาหน้าต่างย่อยที่เป็นตัวเรนเดอร์เกมจริง
         target_hwnd = find_render_hwnd(hwnd)
-        
+
         # 1. พยายามดึงภาพจากหน้าต่างย่อยโดยตรง (ไม่มีขอบ/ไตเติลบาร์)
-        left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
-        w = right - left
-        h = bot - top
-        
-        if w > 50 and h > 50:
-            hwndDC = win32gui.GetWindowDC(target_hwnd)
-            mfcDC  = win32ui.CreateDCFromHandle(hwndDC)
-            saveDC = mfcDC.CreateCompatibleDC()
-            saveBitMap = win32ui.CreateBitmap()
-            saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
-            saveDC.SelectObject(saveBitMap)
-            
-            result = ctypes.windll.user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 3)
-            
-            bmpinfo = saveBitMap.GetInfo()
-            bmpstr = saveBitMap.GetBitmapBits(True)
-            img = np.frombuffer(bmpstr, dtype='uint8')
-            img.shape = (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)
-            
-            win32gui.DeleteObject(saveBitMap.GetHandle())
-            saveDC.DeleteDC()
-            mfcDC.DeleteDC()
-            win32gui.ReleaseDC(target_hwnd, hwndDC)
-            
-            if result == 1:
-                img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                # ตรวจสอบว่ารูปไม่ได้ดำสนิท
-                if np.mean(img_bgr) > 5.0:
-                    return cv2.resize(img_bgr, (800, 450))
+        img_bgr = _printwindow_capture(target_hwnd)
+        if img_bgr is not None and np.mean(img_bgr) > 5.0:
+            return cv2.resize(img_bgr, (800, 450))
 
         # 2. ถ้าดึงจากหน้าต่างย่อยไม่สำเร็จ ให้ย้อนกลับไปดึงจากหน้าต่างหลักแล้วครอปตัดขอบ (Fallback)
-        left, top, right, bot = win32gui.GetWindowRect(hwnd)
-        w = right - left
-        h = bot - top
-        if w <= 0 or h <= 0:
-            return None
-
-        hwndDC = win32gui.GetWindowDC(hwnd)
-        mfcDC  = win32ui.CreateDCFromHandle(hwndDC)
-        saveDC = mfcDC.CreateCompatibleDC()
-        saveBitMap = win32ui.CreateBitmap()
-        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
-        saveDC.SelectObject(saveBitMap)
-        
-        result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)
-        
-        bmpinfo = saveBitMap.GetInfo()
-        bmpstr = saveBitMap.GetBitmapBits(True)
-        img = np.frombuffer(bmpstr, dtype='uint8')
-        img.shape = (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)
-        
-        win32gui.DeleteObject(saveBitMap.GetHandle())
-        saveDC.DeleteDC()
-        mfcDC.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwndDC)
-        
-        if result == 1:
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        img_bgr = _printwindow_capture(hwnd)
+        if img_bgr is not None:
             if img_bgr.shape[0] > 50 and img_bgr.shape[1] > 50:
                 cropped = img_bgr[38:-8, 8:-8]
                 return cv2.resize(cropped, (800, 450))
@@ -248,6 +258,10 @@ class CookieRunAIApp(tk.Tk):
         self.use_boost_start = False
         self.buy_random_boost = True
         self.use_relay = True
+        self.no_action_mode = False
+        self.afk_delay_sec = 125
+        self.gameplay_start_time = 0
+        self.has_logged_afk_transition = False
         self.loading_start_time = 0
         self.dismiss_clicks = 0
 
@@ -271,10 +285,11 @@ class CookieRunAIApp(tk.Tk):
         self.STATE_WAIT_SELECTBUFF_3 = "WAIT_SELECTBUFF_3"
         self.STATE_WAIT_START = "WAIT_START"
         self.STATE_WAIT_LOADING = "WAIT_LOADING"
+        self.STATE_WAIT_BUFF_RESULT = "WAIT_BUFF_RESULT"
         self.STATE_RESTING = "RESTING"
         
-        self.current_state = self.STATE_PLAYING
-        self.last_action_time = 0
+        self.current_state = self.STATE_WAIT_PLAYLOBBY if self.autostart_enabled else self.STATE_PLAYING
+        self.last_action_time = time.time()
         self.last_random_jump_check_time = 0
         self.last_switch_check_time = 0
         self.last_endgame_check_time = 0
@@ -289,6 +304,11 @@ class CookieRunAIApp(tk.Tk):
         self.cached_switch_rect = None
         self.cached_switch_val = 0.0
         self.FALLBACK_COOKIE_X = 220
+        
+        # Anti-Detection Variables
+        self.current_jitter = 0.0
+        self.last_closest_dist = 0
+        self.last_junk_input_time = time.time()
         
         # TTC / Speed tracking variables
         self.last_obstacle_x = None
@@ -324,9 +344,10 @@ class CookieRunAIApp(tk.Tk):
                 if win32gui.IsWindowVisible(h):
                     t = win32gui.GetWindowText(h)
                     c = win32gui.GetClassName(h)
-                    if "android device" in t.lower() or "mumuplayer" in t.lower() or "mumu" in c.lower() or "mumu" in t.lower():
-                        found_hwnd[0] = h
-                        return False
+                    if "android device" in t.lower() or "mumuplayer" in t.lower() or "mumu player" in t.lower():
+                        if "tool" not in c.lower():
+                            found_hwnd[0] = h
+                            return False
                 return True
             try:
                 win32gui.EnumWindows(enum_cb, None)
@@ -341,15 +362,42 @@ class CookieRunAIApp(tk.Tk):
             print("❌ ไม่พบหน้าต่างโปรแกรมจำลอง MuMu Player! กรุณาเปิดโปรแกรมจำลองขึ้นมาก่อนรันบอท")
 
         # 2. Load YOLO model
-        if os.path.exists("best.onnx"):
-            print("📥 กำลังโหลดโมเดล YOLOv8 'best.onnx' (ONNX Runtime)...")
-            self.model = YOLO("best.onnx")
-            print("✅ โหลดโมเดล YOLOv8 (ONNX) สำเร็จ! (กินสเปคน้อยลง)")
-        elif os.path.exists("best.pt"):
-            print("📥 กำลังโหลดโมเดล YOLOv8 'best.pt'...")
-            self.model = YOLO("best.pt")
-            print("✅ โหลดโมเดล YOLOv8 สำเร็จ!")
+        self.use_gpu = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                self.use_gpu = True
+                print("❇️ PyTorch CUDA (GPU) detected and enabled!")
+        except Exception:
+            pass
+
+        # If GPU is enabled, prioritize PyTorch (.pt) since PyTorch CUDA is already verified working
+        # If CPU only, prioritize ONNX (.onnx) for faster CPU execution
+        model_loaded = False
+        if self.use_gpu:
+            if os.path.exists("best.pt"):
+                print("📥 กำลังโหลดโมเดล YOLOv8 'best.pt' (PyTorch CUDA)...")
+                self.model = YOLO("best.pt")
+                print("✅ โหลดโมเดล YOLOv8 (.pt) บน GPU สำเร็จ!")
+                model_loaded = True
+            elif os.path.exists("best.onnx"):
+                print("📥 กำลังโหลดโมเดล YOLOv8 'best.onnx' (ONNX Runtime)...")
+                self.model = YOLO("best.onnx")
+                print("✅ โหลดโมเดล YOLOv8 (ONNX) สำเร็จ!")
+                model_loaded = True
         else:
+            if os.path.exists("best.onnx"):
+                print("📥 กำลังโหลดโมเดล YOLOv8 'best.onnx' (ONNX CPU)...")
+                self.model = YOLO("best.onnx")
+                print("✅ โหลดโมเดล YOLOv8 (ONNX) บน CPU สำเร็จ!")
+                model_loaded = True
+            elif os.path.exists("best.pt"):
+                print("📥 กำลังโหลดโมเดล YOLOv8 'best.pt'...")
+                self.model = YOLO("best.pt")
+                print("✅ โหลดโมเดล YOLOv8 สำเร็จ!")
+                model_loaded = True
+
+        if not model_loaded:
             print("❌ ไม่พบโมเดล 'best.onnx' หรือ 'best.pt' ในโฟลเดอร์บอท!")
 
         # 3. Load switch template
@@ -394,32 +442,69 @@ class CookieRunAIApp(tk.Tk):
         print("✅ โหลดปุ่ม Autostart ทั้งหมดสำเร็จ!")
 
     def create_layout(self):
-        # Configure grid for root window
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-        
-        # --- Left Panel: Control and Settings ---
-        self.sidebar_frame = tk.Frame(self, bg="#1e1e24")
-        self.sidebar_frame.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
-        
-        # Header title
-        self.logo_label = tk.Label(self.sidebar_frame, text="Cookie Run AI Bot", font=("Arial", 16, "bold"), fg="#3498db", bg="#1e1e24")
-        self.logo_label.pack(pady=(20, 5))
-        
-        # Connection status label
-        status_text = "Emulator: CONNECTED" if self.hwnd else "Emulator: DISCONNECTED"
-        status_color = "#2ecc71" if self.hwnd else "#e74c3c"
-        self.status_label = tk.Label(self.sidebar_frame, text=status_text, font=("Arial", 10, "bold"), fg=status_color, bg="#1e1e24")
-        self.status_label.pack(pady=(0, 20))
-        
-        # Decorative divider
-        self.divider = tk.Frame(self.sidebar_frame, height=2, bg="#2c2c35")
-        self.divider.pack(fill="x", padx=20, pady=5)
-        
-        # Settings Container
-        self.settings_frame = tk.Frame(self.sidebar_frame, bg="#1e1e24")
-        self.settings_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
+        # === Color Palette (GitHub Dark Inspired) ===
+        self.C_BG = "#0d1117"        # Window background
+        self.C_CARD = "#161b22"      # Card/section background
+        self.C_BORDER = "#30363d"    # Borders and dividers
+        self.C_TEXT = "#e6edf3"      # Primary text
+        self.C_TEXT2 = "#8b949e"     # Secondary text
+        self.C_ACCENT = "#58a6ff"    # Accent blue
+        self.C_GREEN = "#3fb950"     # Success green
+        self.C_RED = "#f85149"       # Error red
+        self.C_YELLOW = "#d29922"    # Warning yellow
+        self.C_PURPLE = "#bc8cff"    # Purple accent
+        self.C_TROUGH = "#21262d"    # Slider trough
+
+        self.configure(bg=self.C_BG)
+        self.geometry("370x640")
+
+        # Scrollable main container
+        main = tk.Frame(self, bg=self.C_BG)
+        main.pack(fill="both", expand=True, padx=12, pady=10)
+
+        # ─── HEADER ───
+        header = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        header.pack(fill="x", pady=(0, 8))
+
+        tk.Label(header, text="🍪", font=("Segoe UI Emoji", 20), bg=self.C_CARD).pack(side="left", padx=(12, 4), pady=8)
+        title_frame = tk.Frame(header, bg=self.C_CARD)
+        title_frame.pack(side="left", fill="x", expand=True, pady=8)
+        tk.Label(title_frame, text="Cookie Run AI Bot", font=("Segoe UI", 14, "bold"), fg=self.C_TEXT, bg=self.C_CARD).pack(anchor="w")
+
+        status_text = "● Connected" if self.hwnd else "● Disconnected"
+        status_color = self.C_GREEN if self.hwnd else self.C_RED
+        self.status_label = tk.Label(title_frame, text=status_text, font=("Segoe UI", 9), fg=status_color, bg=self.C_CARD)
+        self.status_label.pack(anchor="w")
+
+        # ─── PROFILE CARD ───
+        profile_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        profile_card.pack(fill="x", pady=(0, 6))
+        profile_inner = tk.Frame(profile_card, bg=self.C_CARD)
+        profile_inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(profile_inner, text="▸ Farm Profile", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Dark.TCombobox", fieldbackground=self.C_TROUGH, background=self.C_CARD, foreground=self.C_TEXT, arrowcolor=self.C_TEXT, borderwidth=0)
+
+        self.profile_combo = ttk.Combobox(
+            profile_inner,
+            values=["Stage 1 (ฟาร์มเงิน/เหรียญ)", "Stage 3 (วิ่งทำระยะ)", "Stage 6 (Auto Run / ฟาร์มกล่อง AFK)", "Stage 7 (Pure AFK / วิ่งอัตโนมัติไม่กดปุ่ม)"],
+            state="readonly", font=("Segoe UI", 9), style="Dark.TCombobox"
+        )
+        self.profile_combo.set("Stage 1 (ฟาร์มเงิน/เหรียญ)")
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
+        self.profile_combo.pack(fill="x")
+
+        # ─── FEATURES CARD ───
+        feat_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        feat_card.pack(fill="x", pady=(0, 6))
+        feat_inner = tk.Frame(feat_card, bg=self.C_CARD)
+        feat_inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(feat_inner, text="▸ Features", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
+
         # Tkinter variables for Checkbuttons
         self.autostart_var = tk.IntVar(value=1 if self.autostart_enabled else 0)
         self.rest_var = tk.IntVar(value=1 if self.rest_breaks_enabled else 0)
@@ -428,133 +513,120 @@ class CookieRunAIApp(tk.Tk):
         self.buy_random_boost_var = tk.IntVar(value=1 if self.buy_random_boost else 0)
         self.use_relay_var = tk.IntVar(value=1 if self.use_relay else 0)
 
-        # Profile Selector (เลือกด่านฟาร์ม)
-        self.profile_title = tk.Label(self.settings_frame, text="Farm Profile (เลือกด่านฟาร์ม):", font=("Arial", 10, "bold"), fg="#ffffff", bg="#1e1e24")
-        self.profile_title.pack(anchor="w", pady=(0, 2))
-        
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("TCombobox", fieldbackground="#2c2c35", background="#1e1e24", foreground="#ffffff", arrowcolor="#ffffff")
-        
-        self.profile_combo = ttk.Combobox(
-            self.settings_frame, 
-            values=["Stage 1 (ฟาร์มเงิน/เหรียญ)", "Stage 3 (วิ่งทำระยะ)"],
-            state="readonly",
-            font=("Arial", 10)
+        toggle_opts = dict(
+            font=("Segoe UI", 9), bg=self.C_CARD, fg=self.C_TEXT,
+            selectcolor=self.C_TROUGH, activebackground=self.C_CARD,
+            activeforeground=self.C_TEXT, bd=0, highlightthickness=0, anchor="w"
         )
-        self.profile_combo.set("Stage 1 (ฟาร์มเงิน/เหรียญ)")
-        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
-        self.profile_combo.pack(fill="x", pady=(0, 10))
 
-        # Toggle Switch for Auto Start
-        self.autostart_switch = tk.Checkbutton(
-            self.settings_frame, text="Auto Start Game", font=("Arial", 10, "bold"),
-            variable=self.autostart_var, command=self.on_toggle_autostart,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
-        )
-        self.autostart_switch.pack(pady=3, anchor="w")
-        
-        # Toggle Switch for Auto-Rest Breaks
-        self.rest_switch = tk.Checkbutton(
-            self.settings_frame, text="Auto-Rest Breaks", font=("Arial", 10, "bold"),
-            variable=self.rest_var, command=self.on_toggle_rest,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
-        )
-        self.rest_switch.pack(pady=3, anchor="w")
-        
-        # Toggle Switch for Eco Mode
-        self.eco_mode_switch = tk.Checkbutton(
-            self.settings_frame, text="Eco Mode (20 FPS)", font=("Arial", 10, "bold"),
-            variable=self.eco_var, command=self.on_toggle_eco,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
-        )
-        self.eco_mode_switch.pack(pady=3, anchor="w")
+        toggles = [
+            ("Auto Start Game", self.autostart_var, self.on_toggle_autostart),
+            ("Auto-Rest Breaks", self.rest_var, self.on_toggle_rest),
+            ("Eco Mode (20 FPS)", self.eco_var, self.on_toggle_eco),
+            ("Boost Start (Stage 3)", self.boost_start_var, self.on_toggle_boost_start),
+            ("Buy Random Boost", self.buy_random_boost_var, self.on_toggle_buy_random_boost),
+            ("Use Relay Cookie (ผลัดสอง)", self.use_relay_var, self.on_toggle_relay),
+        ]
+        for text, var, cmd in toggles:
+            tk.Checkbutton(feat_inner, text=text, variable=var, command=cmd, **toggle_opts).pack(fill="x", pady=1)
 
-        # Toggle Switch for Boost Start Clicker
-        self.boost_start_switch = tk.Checkbutton(
-            self.settings_frame, text="Click Boost Start (Stage 3)", font=("Arial", 10, "bold"),
-            variable=self.boost_start_var, command=self.on_toggle_boost_start,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
-        )
-        self.boost_start_switch.pack(pady=3, anchor="w")
+        # ─── SESSION CARD ───
+        sess_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        sess_card.pack(fill="x", pady=(0, 6))
+        sess_inner = tk.Frame(sess_card, bg=self.C_CARD)
+        sess_inner.pack(fill="x", padx=12, pady=8)
 
-        # Toggle Switch for Buying Random Boost (Double Coins)
-        self.buy_random_boost_switch = tk.Checkbutton(
-            self.settings_frame, text="Buy Random Boost (Double Coin)", font=("Arial", 10, "bold"),
-            variable=self.buy_random_boost_var, command=self.on_toggle_buy_random_boost,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
-        )
-        self.buy_random_boost_switch.pack(pady=3, anchor="w")
+        sess_header = tk.Frame(sess_inner, bg=self.C_CARD)
+        sess_header.pack(fill="x", pady=(0, 5))
+        tk.Label(sess_header, text="▸ Session", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(side="left")
+        self.session_runs_label = tk.Label(sess_header, text=f"{self.current_session_runs}/{self.target_session_runs} games", font=("Segoe UI", 9, "bold"), fg=self.C_PURPLE, bg=self.C_CARD)
+        self.session_runs_label.pack(side="right")
 
-        # Toggle Switch for Using Relay Character (ผลัดสอง)
-        self.use_relay_switch = tk.Checkbutton(
-            self.settings_frame, text="Use Relay Cookie (ผลัดสอง)", font=("Arial", 10, "bold"),
-            variable=self.use_relay_var, command=self.on_toggle_relay,
-            bg="#1e1e24", fg="#ffffff", selectcolor="#2c2c35",
-            activebackground="#1e1e24", activeforeground="#ffffff", bd=0, highlightthickness=0
+        # Canvas Progress Bar
+        self.progress_canvas = tk.Canvas(sess_inner, height=8, bg=self.C_TROUGH, highlightthickness=0, bd=0)
+        self.progress_canvas.pack(fill="x", pady=(0, 2))
+        self.progress_bar_id = self.progress_canvas.create_rectangle(0, 0, 0, 8, fill=self.C_PURPLE, outline="")
+        self._update_progress_bar()
+
+        # ─── TUNING CARD ───
+        tune_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        tune_card.pack(fill="x", pady=(0, 6))
+        tune_inner = tk.Frame(tune_card, bg=self.C_CARD)
+        tune_inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(tune_inner, text="▸ Tuning", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 4))
+
+        slider_opts = dict(
+            orient=tk.HORIZONTAL, bg=self.C_CARD, fg=self.C_TEXT,
+            troughcolor=self.C_TROUGH, activebackground=self.C_ACCENT,
+            bd=0, highlightthickness=0, showvalue=False, sliderrelief="flat"
         )
-        self.use_relay_switch.pack(pady=3, anchor="w")
-        
-        # Session Progress Label
-        self.session_runs_label = tk.Label(self.settings_frame, text=f"Session: {self.current_session_runs}/{self.target_session_runs} games", font=("Arial", 10, "bold"), fg="#9b59b6", bg="#1e1e24")
-        self.session_runs_label.pack(anchor="w", pady=(8, 2))
-        
-        # Slider 0: Max Games per Session
-        self.session_limit_title = tk.Label(self.settings_frame, text=f"Max Games/Session: {self.max_session_runs_limit} runs", font=("Arial", 9), fg="#ffffff", bg="#1e1e24")
-        self.session_limit_title.pack(anchor="w", pady=(5, 1))
-        self.session_limit_slider = tk.Scale(
-            self.settings_frame, from_=5, to=30, orient=tk.HORIZONTAL, command=self.on_session_limit_change,
-            bg="#1e1e24", fg="#ffffff", troughcolor="#2c2c35", activebackground="#3498db",
-            bd=0, highlightthickness=0, showvalue=False
-        )
+
+        # Slider: Max Games/Session
+        self.session_limit_title = tk.Label(tune_inner, text=f"Max Games/Session: {self.max_session_runs_limit}", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.session_limit_title.pack(anchor="w")
+        self.session_limit_slider = tk.Scale(tune_inner, from_=5, to=30, command=self.on_session_limit_change, **slider_opts)
         self.session_limit_slider.set(self.max_session_runs_limit)
-        self.session_limit_slider.pack(fill="x", pady=(0, 5))
-        
-        # Slider 1: Trigger Distance
-        self.dist_title = tk.Label(self.settings_frame, text=f"Trigger Distance: {self.trigger_dist} px", font=("Arial", 9), fg="#ffffff", bg="#1e1e24")
-        self.dist_title.pack(anchor="w", pady=(5, 1))
-        self.dist_slider = tk.Scale(
-            self.settings_frame, from_=50, to=300, orient=tk.HORIZONTAL, command=self.on_dist_change,
-            bg="#1e1e24", fg="#ffffff", troughcolor="#2c2c35", activebackground="#3498db",
-            bd=0, highlightthickness=0, showvalue=False
-        )
+        self.session_limit_slider.pack(fill="x", pady=(0, 4))
+
+        # Slider: Trigger Distance
+        self.dist_title = tk.Label(tune_inner, text=f"Trigger Distance: {self.trigger_dist} px", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.dist_title.pack(anchor="w")
+        self.dist_slider = tk.Scale(tune_inner, from_=50, to=300, command=self.on_dist_change, **slider_opts)
         self.dist_slider.set(self.trigger_dist)
-        self.dist_slider.pack(fill="x", pady=(0, 5))
-        
-        # Slider 2: Slide Hold ms
-        self.slide_title = tk.Label(self.settings_frame, text=f"Slide Hold: {self.slide_hold_ms} ms", font=("Arial", 9), fg="#ffffff", bg="#1e1e24")
-        self.slide_title.pack(anchor="w", pady=(5, 1))
-        self.slide_slider = tk.Scale(
-            self.settings_frame, from_=100, to=1500, orient=tk.HORIZONTAL, command=self.on_slide_change,
-            bg="#1e1e24", fg="#ffffff", troughcolor="#2c2c35", activebackground="#3498db",
-            bd=0, highlightthickness=0, showvalue=False
-        )
+        self.dist_slider.pack(fill="x", pady=(0, 4))
+
+        # Slider: Slide Hold
+        self.slide_title = tk.Label(tune_inner, text=f"Slide Hold: {self.slide_hold_ms} ms", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.slide_title.pack(anchor="w")
+        self.slide_slider = tk.Scale(tune_inner, from_=100, to=1500, command=self.on_slide_change, **slider_opts)
         self.slide_slider.set(self.slide_hold_ms)
-        self.slide_slider.pack(fill="x", pady=(0, 5))
-        
-        # Slider 3: YOLO Conf threshold
-        self.conf_title = tk.Label(self.settings_frame, text=f"YOLO Threshold: {int(self.conf_val * 100)}%", font=("Arial", 9), fg="#ffffff", bg="#1e1e24")
-        self.conf_title.pack(anchor="w", pady=(5, 1))
-        self.conf_slider = tk.Scale(
-            self.settings_frame, from_=0.10, to=0.85, resolution=0.01, orient=tk.HORIZONTAL, command=self.on_conf_change,
-            bg="#1e1e24", fg="#ffffff", troughcolor="#2c2c35", activebackground="#3498db",
-            bd=0, highlightthickness=0, showvalue=False
-        )
+        self.slide_slider.pack(fill="x", pady=(0, 4))
+
+        # Slider: YOLO Confidence
+        self.conf_title = tk.Label(tune_inner, text=f"YOLO Threshold: {int(self.conf_val * 100)}%", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.conf_title.pack(anchor="w")
+        self.conf_slider = tk.Scale(tune_inner, from_=0.10, to=0.85, resolution=0.01, command=self.on_conf_change, **slider_opts)
         self.conf_slider.set(self.conf_val)
-        self.conf_slider.pack(fill="x", pady=(0, 8))
-        
-        # Second divider
-        self.divider2 = tk.Frame(self.sidebar_frame, height=2, bg="#2c2c35")
-        self.divider2.pack(fill="x", padx=20, pady=5)
-        
-        # Bottom Status Indicator
-        self.bot_status_label = tk.Label(self.sidebar_frame, text="STATUS: RUNNING", font=("Arial", 13, "bold"), fg="#2ecc71", bg="#1e1e24")
-        self.bot_status_label.pack(pady=15)
+        self.conf_slider.pack(fill="x", pady=(0, 4))
+
+        # Slider: AFK Run Time (Stage 6)
+        m = self.afk_delay_sec // 60
+        s = self.afk_delay_sec % 60
+        self.afk_delay_title = tk.Label(tune_inner, text=f"AFK Run Time: {self.afk_delay_sec}s ({m}:{s:02d})", font=("Segoe UI", 8), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.afk_delay_title.pack(anchor="w")
+        self.afk_delay_slider = tk.Scale(tune_inner, from_=10, to=300, command=self.on_afk_delay_change, **slider_opts)
+        self.afk_delay_slider.set(self.afk_delay_sec)
+        self.afk_delay_slider.pack(fill="x")
+
+        # ─── LIVE STATS CARD ───
+        stats_card = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        stats_card.pack(fill="x", pady=(0, 6))
+        stats_inner = tk.Frame(stats_card, bg=self.C_CARD)
+        stats_inner.pack(fill="x", padx=12, pady=6)
+
+        tk.Label(stats_inner, text="▸ Live Stats", font=("Segoe UI", 9, "bold"), fg=self.C_ACCENT, bg=self.C_CARD).pack(anchor="w", pady=(0, 2))
+        self.speed_label = tk.Label(stats_inner, text="Speed: --- px/s  |  TTC: ---s", font=("Consolas", 9), fg=self.C_TEXT2, bg=self.C_CARD)
+        self.speed_label.pack(anchor="w")
+
+        # ─── STATUS BAR ───
+        status_bar = tk.Frame(main, bg=self.C_CARD, highlightbackground=self.C_BORDER, highlightthickness=1)
+        status_bar.pack(fill="x")
+        self.bot_status_label = tk.Label(status_bar, text="STATUS: RUNNING", font=("Segoe UI", 12, "bold"), fg=self.C_GREEN, bg=self.C_CARD)
+        self.bot_status_label.pack(pady=10)
+
+    def _update_progress_bar(self):
+        """อัปเดต Canvas progress bar ตามจำนวนรอบที่เล่น"""
+        self.progress_canvas.update_idletasks()
+        canvas_w = self.progress_canvas.winfo_width()
+        if canvas_w <= 1:
+            canvas_w = 300  # fallback ก่อน widget render
+        if self.target_session_runs > 0:
+            ratio = min(self.current_session_runs / self.target_session_runs, 1.0)
+        else:
+            ratio = 0
+        fill_w = int(canvas_w * ratio)
+        self.progress_canvas.coords(self.progress_bar_id, 0, 0, fill_w, 8)
         
 
 
@@ -571,12 +643,14 @@ class CookieRunAIApp(tk.Tk):
             self.buy_random_boost = True
             self.use_boost_start = False
             self.use_relay = True
+            self.no_action_mode = False
+            self.afk_delay_sec = 0
             
-            self.trigger_dist = 140
-            self.dist_slider.set(140)
-            self.dist_title.configure(text="Trigger Distance: 140 px")
+            self.trigger_dist = 130
+            self.dist_slider.set(130)
+            self.dist_title.configure(text="Trigger Distance: 130 px")
             
-            print("   - Auto-configured for Stage 1: Buy Buff=ON, Boost Start=OFF, Relay=ON, Trigger Dist=140px")
+            print("   - Auto-configured for Stage 1: Buy Buff=ON, Boost Start=OFF, Relay=ON, Trigger Dist=130px")
         elif "Stage 3" in selected:
             # Stage 3 Settings
             self.buy_random_boost_var.set(0)
@@ -586,12 +660,50 @@ class CookieRunAIApp(tk.Tk):
             self.buy_random_boost = False
             self.use_boost_start = True
             self.use_relay = False
+            self.no_action_mode = False
+            self.afk_delay_sec = 0
             
             self.trigger_dist = 165
             self.dist_slider.set(165)
             self.dist_title.configure(text="Trigger Distance: 165 px")
             
             print("   - Auto-configured for Stage 3: Buy Buff=OFF, Boost Start=ON, Relay=OFF, Trigger Dist=165px")
+        elif "Stage 6" in selected:
+            # Stage 6 Settings (AFK Auto Run - No jump/slide for 2:05 mins, then normal play)
+            self.buy_random_boost_var.set(0)
+            self.boost_start_var.set(0)
+            self.use_relay_var.set(0)
+            
+            self.buy_random_boost = False
+            self.use_boost_start = False
+            self.use_relay = False
+            self.no_action_mode = True
+            self.afk_delay_sec = 125
+            
+            if hasattr(self, "afk_delay_slider"):
+                self.afk_delay_slider.set(125)
+                m = 125 // 60
+                s = 125 % 60
+                self.afk_delay_title.configure(text=f"AFK Run Time: 125s ({m}:{s:02d})")
+            
+            print("   - Auto-configured for Stage 6: AFK Auto Run (125s AFK -> Normal Dodge, Auto Restart=ON)")
+        elif "Stage 7" in selected:
+            # Stage 7 Settings (Pure AFK - No actions at all, just restart loop)
+            self.buy_random_boost_var.set(0)
+            self.boost_start_var.set(0)
+            self.use_relay_var.set(0)
+            
+            self.buy_random_boost = False
+            self.use_boost_start = False
+            self.use_relay = False
+            self.no_action_mode = True
+            self.afk_delay_sec = 999999
+            
+            if hasattr(self, "afk_delay_slider"):
+                self.afk_delay_slider.set(300)
+                self.afk_delay_title.configure(text="AFK Run Time: Infinite (Pure AFK)")
+            
+            print("   - Auto-configured for Stage 7: Pure AFK (No Jump/Slide, Auto Restart=ON)")
             
         self.update_session_label()
 
@@ -603,11 +715,12 @@ class CookieRunAIApp(tk.Tk):
     def update_session_label(self):
         if self.rest_breaks_enabled:
             if self.current_state == self.STATE_RESTING:
-                self.session_runs_label.configure(text=f"Session: {self.current_session_runs}/{self.target_session_runs} (Resting)")
+                self.session_runs_label.configure(text=f"{self.current_session_runs}/{self.target_session_runs} (Resting)")
             else:
-                self.session_runs_label.configure(text=f"Session: {self.current_session_runs}/{self.target_session_runs} games")
+                self.session_runs_label.configure(text=f"{self.current_session_runs}/{self.target_session_runs} games")
         else:
-            self.session_runs_label.configure(text=f"Total Runs: {self.current_session_runs} games (No Rest)")
+            self.session_runs_label.configure(text=f"{self.current_session_runs} games (No Rest)")
+        self._update_progress_bar()
 
     def on_toggle_rest(self):
         self.rest_breaks_enabled = self.rest_var.get() == 1
@@ -650,6 +763,12 @@ class CookieRunAIApp(tk.Tk):
     def on_conf_change(self, val):
         self.conf_val = float(val)
         self.conf_title.configure(text=f"YOLO Threshold: {int(self.conf_val * 100)}%")
+
+    def on_afk_delay_change(self, val):
+        self.afk_delay_sec = int(val)
+        m = self.afk_delay_sec // 60
+        s = self.afk_delay_sec % 60
+        self.afk_delay_title.configure(text=f"AFK Run Time: {self.afk_delay_sec}s ({m}:{s:02d})")
 
     def schedule_action(self, delay, vk_code, action):
         """จองคิวการทำงานแบบ Non-blocking ไว้ล่วงหน้า"""
@@ -706,13 +825,13 @@ class CookieRunAIApp(tk.Tk):
 
     def _update_loop_core(self):
         if not self.hwnd:
-            self.status_label.configure(text="Emulator: DISCONNECTED", fg="#e74c3c")
-            self.bot_status_label.configure(text="STATUS: OFFLINE", fg="#e74c3c")
+            self.status_label.configure(text="● Disconnected", fg=self.C_RED)
+            self.bot_status_label.configure(text="STATUS: OFFLINE", fg=self.C_RED)
             self.init_resources()
             self.after(2000, self.update_loop)
             return
 
-        self.status_label.configure(text="Emulator: CONNECTED", fg="#2ecc71")
+        self.status_label.configure(text="● Connected", fg=self.C_GREEN)
         start_time = time.time()
         now = time.time()
 
@@ -750,6 +869,16 @@ class CookieRunAIApp(tk.Tk):
             return
 
         # 2. Check Autostart state machine (Self-correcting with dynamic retries)
+        if self.autostart_enabled:
+            # Self-healing: if in PLAYING or WAIT_LOADING state but we see the lobby, reset to WAIT_PLAYLOBBY (only after 6s of no action to prevent transition bugs)
+            if (self.current_state == self.STATE_PLAYING or self.current_state == self.STATE_WAIT_LOADING) and (now - self.last_action_time > 6.0):
+                found_lobby_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                if found_lobby_btn and (580 <= rx <= 715):
+                    print(f"[{time.strftime('%H:%M:%S')}] 🔄 ตรวจพบปุ่มหน้าหลัก (Lobby) -> ทำการรีเซ็ตสเตทบอทเป็น WAIT_PLAYLOBBY")
+                    self.current_state = self.STATE_WAIT_PLAYLOBBY
+                    self.gameplay_start_time = 0
+                    self.last_action_time = 0
+
         if self.autostart_enabled and self.current_state != self.STATE_PLAYING and self.current_state != self.STATE_WAIT_LOADING:
             self.bot_status_label.configure(text=f"STATUS: {self.current_state}", fg="#f39c12")
             
@@ -760,21 +889,21 @@ class CookieRunAIApp(tk.Tk):
                 if found_lv:
                     print(f"[{time.strftime('%H:%M:%S')}] ⭐ ตรวจพบป๊อปอัป Level Up! ทำการคลิกปิดเพื่อไปต่อ...")
                     human_click_bg(self.hwnd, cx_lv, cy_lv, "Level Up Close Button")
-                    time.sleep(random.uniform(2.0, 3.5))
-                    self.schedule_next_loop(start_time)
+                    # รอ 2-3.5 วินาทีแบบ non-blocking ให้ animation Level Up เล่นจบก่อนวนลูปถัดไป
+                    self.after(int(random.uniform(2000, 3500)), self.update_loop)
                     return
 
             # Execute state actions
             if self.current_state == self.STATE_WAIT_OK:
-                found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.68)
-                found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.68)
-                found_lobby, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None))
+                found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.62)
+                found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
+                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
                 
                 if found_openall:
                     self.current_state = self.STATE_WAIT_OPENALL
                 elif found_confirm:
                     self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
-                elif found_lobby:
+                elif found_lobby and (580 <= rx <= 715):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "ok" in self.autostart_templates:
@@ -792,16 +921,16 @@ class CookieRunAIApp(tk.Tk):
                                 self.last_action_time = now
 
             elif self.current_state == self.STATE_WAIT_OPENALL:
-                found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.68)
-                found_lobby, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None))
+                found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
+                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
                 
                 if found_confirm:
                     self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
-                elif found_lobby:
+                elif found_lobby and (580 <= rx <= 715):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "openall" in self.autostart_templates:
-                        found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["openall"], threshold=0.68)
+                        found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["openall"], threshold=0.62)
                         if found:
                             if now - self.last_action_time > 1.2:
                                 human_click_bg(self.hwnd, cx, cy, "Open All Button")
@@ -813,12 +942,12 @@ class CookieRunAIApp(tk.Tk):
                                 self.last_action_time = now
 
             elif self.current_state == self.STATE_WAIT_CONFIRM_OPENALL:
-                found_lobby, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None))
-                if found_lobby:
+                found_lobby, rx, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                if found_lobby and (580 <= rx <= 715):
                     self.current_state = self.STATE_WAIT_PLAYLOBBY
                 else:
                     if "confirmafteropenall" in self.autostart_templates:
-                        found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["confirmafteropenall"], threshold=0.68)
+                        found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["confirmafteropenall"], threshold=0.62)
                         if found:
                             if now - self.last_action_time > 1.2:
                                 human_click_bg(self.hwnd, cx, cy, "Confirm After Open All Button")
@@ -831,13 +960,13 @@ class CookieRunAIApp(tk.Tk):
 
             elif self.current_state == self.STATE_WAIT_PLAYLOBBY:
                 if "playlobby" in self.autostart_templates:
-                    found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"])
-                    if found:
-                        # รอ 20.0 วินาทีหลังจากเปลี่ยนสเตทมาที่ WAIT_PLAYLOBBY
+                    found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"], threshold=0.70)
+                    if found and (580 <= cx <= 715):
+                        # รอ 3.0 วินาทีหลังจากเปลี่ยนสเตทมาที่ WAIT_PLAYLOBBY
                         # เพื่อให้เกมรีเฟรชและโหลดหน้าล็อบบี้ให้เสร็จสมบูรณ์ก่อนกด Play
-                        if now - self.last_action_time > 20.0:
-                            print(f"[{time.strftime('%H:%M:%S')}] 🖱️ คลิกปุ่ม Play ล็อบบี้ด้วยพิกัดล็อก (680, 390)")
-                            human_click_bg(self.hwnd, 680, 390, "Play Lobby Button")
+                        if now - self.last_action_time > 3.0:
+                            print(f"[{time.strftime('%H:%M:%S')}] 🖱️ คลิกปุ่ม Play ล็อบบี้ด้วยพิกัดแสกน ({cx}, {cy})")
+                            human_click_bg(self.hwnd, cx, cy, "Play Lobby Button")
                             self.last_action_time = now
                             if self.buy_random_boost:
                                 self.current_state = self.STATE_WAIT_SELECTBUFF_1
@@ -882,15 +1011,64 @@ class CookieRunAIApp(tk.Tk):
                     print(f"[{time.strftime('%H:%M:%S')}] 🖱️ คลิกปุ่ม Multi-Buy ในป๊อปอัป (397, 367)")
                     human_click_bg(self.hwnd, 397, 367, "Multi-Buy Button")
                     self.last_action_time = now
-                    self.current_state = self.STATE_WAIT_START
+                    self.current_state = self.STATE_WAIT_BUFF_RESULT
                     self.dismiss_clicks = 0
+
+            elif self.current_state == self.STATE_WAIT_BUFF_RESULT:
+                # 1. เช็คว่าสุ่มได้บัฟเหรียญ 2 เท่า (Double Coins) หรือยัง
+                found_double_coin = False
+                cx_dc, cy_dc = 610, 400
+                if "affterselectbuff" in self.autostart_templates:
+                    found_dc, tx, ty = find_template_match(self.hwnd, frame, self.autostart_templates["affterselectbuff"], threshold=0.70)
+                    if found_dc:
+                        found_double_coin = True
+                        cx_dc = tx
+                        cy_dc = ty + 25 # เล็งพิกัดกดปุ่ม Play ด้านล่างแถบป้าย
+                
+                if found_double_coin:
+                    print(f"[{time.strftime('%H:%M:%S')}] 🎉 สุ่มได้บัฟเหรียญ 2 เท่า (Double Coins) สำเร็จ! กำลังเริ่มเล่นเกม...")
+                    human_click_bg(self.hwnd, cx_dc, cy_dc, "Play Buff Button (Double Coins)")
+                    
+                    self.current_session_runs += 1
+                    if self.rest_breaks_enabled:
+                        print(f"[{time.strftime('%H:%M:%S')}] 🎮 เริ่มต้นเกมใหม่สำเร็จ! (นับรอบสะสม: {self.current_session_runs}/{self.target_session_runs})")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] 🎮 เริ่มต้นเกมใหม่สำเร็จ! (รอบสะสม: {self.current_session_runs} - ไม่มีพักเบรก)")
+                    self.update_session_label()
+                    
+                    self.current_state = self.STATE_WAIT_LOADING
+                    self.loading_start_time = now
+                    self.last_action_time = now
+                    self.schedule_next_loop(start_time)
+                    return
+                
+                # 2. เช็คว่ามีปุ่มตกลงสีเหลืองสำหรับสุ่มใหม่หรือไม่ (กรณีสุ่มได้บัฟอื่น)
+                if "ok" in self.autostart_templates:
+                    found_ok, cx_ok, cy_ok = find_template_match(self.hwnd, frame, self.autostart_templates["ok"], threshold=0.75)
+                    if found_ok:
+                        if now - self.last_action_time > 1.2:
+                            print(f"[{time.strftime('%H:%M:%S')}] ❌ ไม่ใช่บัฟเหรียญ 2 เท่า -> คลิกตกลงเพื่อสุ่มใหม่...")
+                            human_click_bg(self.hwnd, cx_ok, cy_ok, "Close Result Popup (Retry)")
+                            self.last_action_time = now
+                            self.current_state = self.STATE_WAIT_SELECTBUFF_2
+                            self.schedule_next_loop(start_time)
+                            return
+                
+                # ป้องกันกรณีสปินสุ่มนานเกินไปหรือค้างแบบอื่น (ขยายเวลาสูงสุดเป็น 45 วินาที)
+                if now - self.last_action_time > 45.0:
+                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️ สุ่มบัฟนานเกิน 45 วินาที -> บังคับเคลียร์ปิดร้านค้า")
+                    human_click_bg(self.hwnd, 607, 60, "Close Shop Popup X Button")
+                    self.last_action_time = now
+                    self.current_state = self.STATE_WAIT_START
+                    self.schedule_next_loop(start_time)
+                    return
 
             elif self.current_state == self.STATE_WAIT_START:
                 # เช็คว่าปุ่มเริ่มวิ่งสีเขียว (ใช้รูป playlobby เป็นตัวแทน) ปรากฏขึ้นบนจอหรือยัง
                 found_start = False
                 cx_s, cy_s = 670, 390
                 if "playlobby" in self.autostart_templates:
-                    found, tx, ty = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"], threshold=0.72)
+                    found, tx, ty = find_template_match(self.hwnd, frame, self.autostart_templates["playlobby"], threshold=0.70)
                     if found:
                         found_start = True
                         cx_s = tx
@@ -913,40 +1091,17 @@ class CookieRunAIApp(tk.Tk):
                         self.loading_start_time = now
                         self.last_action_time = now
                 else:
-                    # หากยังไม่เจอปุ่มเริ่มวิ่ง และเรากำลังเล่นโหมดสุ่มบัฟ (buy_random_boost = True)
-                    if self.buy_random_boost:
-                        # เช็คพิกเซลสีเหลืองกึ่งกลางจอ (400, 310) เพื่อดูว่าสุ่มเสร็จแล้วมีป๊อปอัป "ตกลง" ขึ้นมาค้างอยู่หรือไม่
-                        # สีเหลืองของปุ่มตกลงในเกมปกติ: B < 110, G > 175, R > 200 (พิกเซลใน OpenCV เป็น BGR)
-                        pixel = frame[310, 400]
-                        b, g, r = pixel[0], pixel[1], pixel[2]
-                        if r > 200 and g > 175 and b < 110:
-                            print(f"[{time.strftime('%H:%M:%S')}] 🌟 ตรวจพบปุ่มตกลงสีเหลืองแจ้งผลลัพธ์ (400, 310) -> คลิกเพื่อกู้คืนหน้าร้านค้า")
-                            # 1. คลิกกึ่งกลางเพื่อปิดป๊อปอัปสุ่มเจอ (ตกลง/แตะหน้าจอ)
-                            human_click_bg(self.hwnd, 400, 310, "Close Result Popup")
-                            time.sleep(random.uniform(0.3, 0.5))
-                            # 2. คลิกปุ่ม X เพื่อปิดหน้าร้านค้าสุ่มบัฟกลับสู่หน้าเตรียมพร้อม
-                            human_click_bg(self.hwnd, 607, 60, "Close Shop Popup X Button")
-                            self.last_action_time = now
-                        
-                        # ป้องกันกรณีสปินสุ่มนานเกินไปหรือค้างแบบอื่น (ขยายเวลาสูงสุดเป็น 45 วินาที)
-                        elif now - self.last_action_time > 45.0:
-                            print(f"[{time.strftime('%H:%M:%S')}] ⚠️ สุ่มบัฟนานเกิน 45 วินาที -> บังคับเคลียร์ปิดร้านค้า")
-                            human_click_bg(self.hwnd, 400, 310, "Close Result Popup")
-                            time.sleep(random.uniform(0.3, 0.5))
-                            human_click_bg(self.hwnd, 607, 60, "Close Shop Popup X Button")
-                            self.last_action_time = now
-                    else:
-                        # ป้องกันกรณีค้างทั่วไปในโหมดไม่สุ่มบัฟ
-                        if now - self.last_action_time > 15.0:
-                            print(f"[{time.strftime('%H:%M:%S')}] ⚠️ ค้างที่หน้าเตรียมตัวนานเกิน 15 วินาที -> ส่งคลิกปิดหน้าต่างสำรอง (607, 60)")
-                            human_click_bg(self.hwnd, 607, 60, "Close Shop Popup X Button")
-                            self.last_action_time = now
+                    # ป้องกันกรณีค้างทั่วไปในโหมดไม่สุ่มบัฟ
+                    if now - self.last_action_time > 15.0:
+                        print(f"[{time.strftime('%H:%M:%S')}] ⚠️ ค้างที่หน้าเตรียมตัวนานเกิน 15 วินาที -> ส่งคลิกปิดหน้าต่างสำรอง (607, 60)")
+                        human_click_bg(self.hwnd, 607, 60, "Close Shop Popup X Button")
+                        self.last_action_time = now
 
             self.schedule_next_loop(start_time)
             return
 
         # --- NORMAL GAMEPLAY: YOLO Run Controls ---
-        self.bot_status_label.configure(text="STATUS: RUNNING", fg="#2ecc71")
+        self.bot_status_label.configure(text="STATUS: RUNNING", fg=self.C_GREEN)
         self.update_session_label()
         
         # Check if game ended (Anti-ban check before OK click)
@@ -955,57 +1110,60 @@ class CookieRunAIApp(tk.Tk):
                 self.last_endgame_check_time = now
                 
                 # สเตทที่กำลังอยู่ระหว่างโหลดหน้าร้านค้า/สุ่มบัฟ ไม่ควรให้ Sync Check แทรกแซง
-                _transitioning = self.current_state in (
-                    self.STATE_WAIT_SELECTBUFF_1,
-                    self.STATE_WAIT_SELECTBUFF_2,
-                    self.STATE_WAIT_SELECTBUFF_3,
-                    self.STATE_WAIT_START,
-                    self.STATE_WAIT_LOADING,
-                )
-                
-                # เช็คปุ่มอื่นๆ เพื่อกู้คืนสเตทเผื่อบอทรันกลางคันหรือสเตทไม่ตรงกับหน้าจอ
-                found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.68)
-                found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.68)
-                
-                # ใช้ปุ่ม playlobby ร่วมกันในการระบุหน้าจอเพื่อความเสถียร (แยกหน้าระหว่าง Lobby กับ หน้าเตรียมตัว ด้วยพิกัด X ของจุดกึ่งกลาง)
-                found_lobby = False
-                found_start = False
-                found_play_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.82)
-                if found_play_btn:
-                    if rx < 580:
-                        found_start = True  # อยู่หน้าเตรียมตัวเริ่มวิ่ง (Center X ~562)
-                    else:
-                        found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~597)
-                
-                found_buff1, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("selectbuff_1", None), threshold=0.75)
-                
-                if found_openall:
-                    print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกล่องรางวัล (Open All) -> สลับสเตทเป็น WAIT_OPENALL")
-                    self.current_state = self.STATE_WAIT_OPENALL
-                    self.schedule_next_loop(start_time)
-                    return
-                elif found_confirm:
-                    print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกดรับรางวัล (Confirm) -> สลับสเตทเป็น WAIT_CONFIRM_OPENALL")
-                    self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
-                    self.schedule_next_loop(start_time)
-                    return
-                elif found_lobby and not _transitioning:
-                    # ป้องกันการวนซ้ำกดปุ่ม Play ล็อบบี้ระหว่างที่หน้าจอกำลังเปลี่ยนผ่านอยู่
-                    print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าล็อบบี้ (Play Lobby) -> สลับสเตทเป็น WAIT_PLAYLOBBY")
-                    self.current_state = self.STATE_WAIT_PLAYLOBBY
-                    self.schedule_next_loop(start_time)
-                    return
-                elif found_buff1 or found_start:
-                    if not _transitioning:
-                        if self.buy_random_boost:
-                            print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอซื้อบัฟ/เตรียมเริ่มเกม -> สลับสเตทเป็น WAIT_SELECTBUFF_1")
-                            self.current_state = self.STATE_WAIT_SELECTBUFF_1
-                        else:
-                            print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าเตรียมเริ่มเกม -> สลับสเตทเป็น WAIT_START")
-                            self.current_state = self.STATE_WAIT_START
-                            self.dismiss_clicks = 0
-                    self.schedule_next_loop(start_time)
-                    return
+                # และไม่ควรเรียกใช้ Sync Check ระหว่างที่คุกกี้กำลังวิ่งในเกม (STATE_PLAYING) เพื่อป้องกันการแสกนจับเจอปุ่มบนฉากแล้วเอ๋อ
+                if self.current_state != self.STATE_PLAYING:
+                    _transitioning = self.current_state in (
+                        self.STATE_WAIT_SELECTBUFF_1,
+                        self.STATE_WAIT_SELECTBUFF_2,
+                        self.STATE_WAIT_SELECTBUFF_3,
+                        self.STATE_WAIT_START,
+                        self.STATE_WAIT_LOADING,
+                    )
+                    
+                    # เช็คปุ่มอื่นๆ เพื่อกู้คืนสเตทเผื่อบอทรันกลางคันหรือสเตทไม่ตรงกับหน้าจอ
+                    found_openall, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("openall", None), threshold=0.62)
+                    found_confirm, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("confirmafteropenall", None), threshold=0.62)
+                    
+                    # ใช้ปุ่ม playlobby ร่วมกันในการระบุหน้าจอเพื่อความเสถียร (แยกหน้าระหว่าง Lobby กับ หน้าเตรียมตัว ด้วยพิกัด X ของจุดกึ่งกลาง)
+                    found_lobby = False
+                    found_start = False
+                    found_play_btn, rx, ry = find_template_match(self.hwnd, frame, self.autostart_templates.get("playlobby", None), threshold=0.70)
+                    if found_play_btn:
+                        if rx < 580:
+                            found_start = True  # อยู่หน้าเตรียมตัวเริ่มวิ่ง (Center X ~562)
+                        elif 580 <= rx <= 715:
+                            found_lobby = True  # อยู่หน้าล็อบบี้ (Center X ~597)
+                    
+                    found_buff1, _, _ = find_template_match(self.hwnd, frame, self.autostart_templates.get("selectbuff_1", None), threshold=0.75)
+                    
+                    if found_openall:
+                        print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกล่องรางวัล (Open All) -> สลับสเตทเป็น WAIT_OPENALL")
+                        self.current_state = self.STATE_WAIT_OPENALL
+                        self.schedule_next_loop(start_time)
+                        return
+                    elif found_confirm:
+                        print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอกดรับรางวัล (Confirm) -> สลับสเตทเป็น WAIT_CONFIRM_OPENALL")
+                        self.current_state = self.STATE_WAIT_CONFIRM_OPENALL
+                        self.schedule_next_loop(start_time)
+                        return
+                    elif found_lobby and not _transitioning:
+                        # ป้องกันการวนซ้ำกดปุ่ม Play ล็อบบี้ระหว่างที่หน้าจอกำลังเปลี่ยนผ่านอยู่
+                        print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าล็อบบี้ (Play Lobby) -> สลับสเตทเป็น WAIT_PLAYLOBBY")
+                        self.current_state = self.STATE_WAIT_PLAYLOBBY
+                        self.last_action_time = 0
+                        self.schedule_next_loop(start_time)
+                        return
+                    elif found_buff1 or found_start:
+                        if not _transitioning:
+                            if self.buy_random_boost:
+                                print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าจอซื้อบัฟ/เตรียมเริ่มเกม -> สลับสเตทเป็น WAIT_SELECTBUFF_1")
+                                self.current_state = self.STATE_WAIT_SELECTBUFF_1
+                            else:
+                                print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: พบหน้าเตรียมเริ่มเกม -> สลับสเตทเป็น WAIT_START")
+                                self.current_state = self.STATE_WAIT_START
+                                self.dismiss_clicks = 0
+                        self.schedule_next_loop(start_time)
+                        return
 
                 if "ok" in self.autostart_templates:
                     found, cx, cy = find_template_match(self.hwnd, frame, self.autostart_templates["ok"])
@@ -1025,19 +1183,51 @@ class CookieRunAIApp(tk.Tk):
                         else:
                             # Proceed with normal restart flow
                             self.current_state = self.STATE_WAIT_OK
+                            self.last_action_time = now
                             print(f"[{time.strftime('%H:%M:%S')}] 🏁 พบหน้าจอจบเกม (ปุ่ม OK)! สลับเข้าสู่โหมดกดเริ่มใหม่อัตโนมัติ...")
-                            time.sleep(random.uniform(1.5, 3.0))
                             
                             self.bot_status_label.configure(text=f"STATUS: {self.current_state}", fg="#f39c12")
-                            self.schedule_next_loop(start_time)
+                            # รอ 1.5-3.0 วินาทีแบบ non-blocking จำลองมนุษย์ดูหน้าจอก่อนกดต่อ
+                            self.after(int(random.uniform(1500, 3000)), self.update_loop)
                             return
+
+        # Check AFK Run Time timer if in Stage 6 AFK mode
+        if self.no_action_mode and self.current_state == self.STATE_PLAYING:
+            if self.gameplay_start_time == 0:
+                self.gameplay_start_time = now
+
+            elapsed_gameplay = now - self.gameplay_start_time
+
+            if elapsed_gameplay < self.afk_delay_sec:
+                cur_m = int(elapsed_gameplay) // 60
+                cur_s = int(elapsed_gameplay) % 60
+                if self.afk_delay_sec > 10000:
+                    status_text = f"STATUS: PURE AFK ({cur_m}:{cur_s:02d})"
+                else:
+                    max_m = self.afk_delay_sec // 60
+                    max_s = self.afk_delay_sec % 60
+                    status_text = f"STATUS: AFK RUNNING ({cur_m}:{cur_s:02d} / {max_m}:{max_s:02d})"
+                
+                self.bot_status_label.configure(
+                    text=status_text,
+                    fg=self.C_ACCENT
+                )
+                self.schedule_next_loop(start_time)
+                return
+            else:
+                if not self.has_logged_afk_transition:
+                    self.has_logged_afk_transition = True
+                    print(f"[{time.strftime('%H:%M:%S')}] 📦 ครบเวลา AFK {self.afk_delay_sec} วินาที (เก็บกล่องเรียบร้อย) -> สลับเข้าสู่โหมดหลบสิ่งกีดขวางตามปกติ!")
 
         # YOLO inference
         if self.model is None:
             self.after(30, self.update_loop)
             return
 
-        results = self.model(frame, conf=self.conf_val, verbose=False)
+        if hasattr(self, "use_gpu") and self.use_gpu:
+            results = self.model(frame, conf=self.conf_val, verbose=False, device="cuda")
+        else:
+            results = self.model(frame, conf=self.conf_val, verbose=False)
 
         found_jump_obstacle = False
         found_double_jump_obstacle = False
@@ -1058,6 +1248,17 @@ class CookieRunAIApp(tk.Tk):
                 detected_objects.append((int(x1), int(y1), int(x2), int(y2), class_name, score))
                 if class_name == "cookie":
                     cookie_box = (int(x1), int(y1), int(x2), int(y2))
+
+        # หากเปิดบอทกลางเกมหรืออยู่สถานะอื่นนอกจากการเล่น/พัก แต่ตรวจเจอตัวคุกกี้และแผ่นดินใต้เท้า (ground)
+        # ให้ซิงค์สเตทเข้าสู่การควบคุมการเล่น (STATE_PLAYING) ทันทีโดยไม่ต้องรอจบรอบ
+        if self.autostart_enabled and self.current_state not in (self.STATE_PLAYING, self.STATE_RESTING):
+            has_cookie = any(obj[4] == "cookie" for obj in detected_objects)
+            has_ground = any(obj[4] == "ground" for obj in detected_objects)
+            if has_cookie and has_ground:
+                print(f"[{time.strftime('%H:%M:%S')}] 🔄 ซิงค์สเตทกลางคัน: ตรวจพบตัวละครคุกกี้และพื้นฉากเกมเพลย์ -> สลับเข้าสู่โหมดควบคุมการเล่น (STATE_PLAYING) ทันที!")
+                self.current_state = self.STATE_PLAYING
+                self.gameplay_start_time = now
+                self.last_action_time = now
 
         # หากอยู่ในสถานะรอโหลดเข้าเกมแบบไดนามิก
         if self.current_state == self.STATE_WAIT_LOADING:
@@ -1092,24 +1293,40 @@ class CookieRunAIApp(tk.Tk):
             
             should_activate = False
             if self.use_boost_start:
-                # กรณีเปิดใช้ Boost: จะต้องพบปุ่ม Boost Start จริงๆ หรือถ้าหมดเวลา 2.5 วินาทีแล้วก็ให้ยอมปล่อยผ่านเมื่อเจอเกมเพลย์
-                if found_btn or (elapsed_loading > 2.5 and found_gameplay):
+                # กรณีเปิดใช้ Boost: จะต้องพบปุ่ม Boost Start จริงๆ หรือถ้าหมดเวลา 2.5 วินาทีแล้วก็ให้ยอมปล่อยผ่านเมื่อเจอเกมเพลย์ หรือหมดเวลา 6 วินาทีป้องกันค้าง
+                if found_btn or (elapsed_loading > 2.5 and found_gameplay) or elapsed_loading > 6.0:
                     should_activate = True
             else:
-                # กรณีไม่ใช้ Boost: ตรวจเจอฉากเกมเพลย์ปกติก็เริ่มเล่นได้ทันที
-                if found_gameplay:
+                # กรณีไม่ใช้ Boost: ตรวจเจอฉากเกมเพลย์ปกติก็เริ่มเล่นได้ทันที หรือถ้าหมดเวลา 5 วินาทีแล้วยังหาไม่เจอให้ข้ามไปเล่นเลย
+                if found_gameplay or elapsed_loading > 5.0:
                     should_activate = True
+            
+            if not hasattr(self, "last_loading_print_time"):
+                self.last_loading_print_time = 0
+            if now - self.last_loading_print_time > 1.0:
+                self.last_loading_print_time = now
+                print(f"[DEBUG Loading] state=WAIT_LOADING, elapsed={elapsed_loading:.1f}s, found_gameplay={found_gameplay}, should_activate={should_activate}")
             
             if should_activate:
                 print(f"[{time.strftime('%H:%M:%S')}] 🎮 โหลดเข้าสู่เกมเรียบร้อย! (ปุ่ม Boost={found_btn}, ออบเจกต์ในเกม={found_gameplay}, โหลดด่าน={elapsed_loading:.1f}s)")
                 if self.use_boost_start and found_btn:
-                    print(f"[{time.strftime('%H:%M:%S')}] 🚀 ส่งคีย์ Alt + คลิกเมาส์ที่พิกัด ({cx_btn}, {cy_btn}) เพื่อใช้ Boost Start (สแปม 3 ครั้งติดกัน)")
-                    for i in range(3):
-                        human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
-                        human_click_bg(self.hwnd, cx_btn, cy_btn, f"Activate Boost Start #{i+1}")
-                        time.sleep(0.15)
+                    print(f"[{time.strftime('%H:%M:%S')}] 🚀 ส่งคีย์ Alt + คลิกเมาส์ที่พิกัด ({cx_btn}, {cy_btn}) เพื่อใช้ Boost Start (สแปม 3 ครั้งแบบ non-blocking)")
+                    # ครั้งแรกส่งทันที
+                    human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
+                    human_click_bg(self.hwnd, cx_btn, cy_btn, "Activate Boost Start #1")
+                    # ครั้งที่ 2 และ 3 จองคิวด้วย self.after() แทน time.sleep()
+                    self.after(150, lambda: (
+                        human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08),
+                        human_click_bg(self.hwnd, cx_btn, cy_btn, "Activate Boost Start #2")
+                    ))
+                    self.after(300, lambda: (
+                        human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08),
+                        human_click_bg(self.hwnd, cx_btn, cy_btn, "Activate Boost Start #3")
+                    ))
                 
                 self.current_state = self.STATE_PLAYING
+                self.gameplay_start_time = now
+                self.has_logged_afk_transition = False
                 self.last_action_time = now
             else:
                 # ยังโหลดไม่เสร็จ หรือกำลังรอให้ปุ่มปีกนกเด้งขึ้นมาฉายเดี่ยว
@@ -1206,6 +1423,12 @@ class CookieRunAIApp(tk.Tk):
         if closest_obstacle_info is not None:
             obs_x1, obs_y1, obs_x2, obs_y2, obs_name, dist = closest_obstacle_info
             
+            # Anti-Detection: สุ่มความคลาดเคลื่อนจังหวะกด (Jitter) ล่าสุดแบบรายอุปสรรค
+            # หากระยะทางเพิ่มขึ้น (เช็ค dist > self.last_closest_dist + 50) แสดงว่าเป็นอุปสรรคชิ้นใหม่ ให้สุ่ม Jitter ใหม่
+            if self.last_closest_dist == 0 or dist > self.last_closest_dist + 50:
+                self.current_jitter = random.uniform(-0.04, 0.04) # สุ่ม +/- 40ms เพื่อไม่ให้จังหวะทริกเกอร์คงที่
+            self.last_closest_dist = dist
+            
             if self.last_obstacle_x is not None and self.last_obstacle_time is not None:
                 dt = now - self.last_obstacle_time
                 dx = self.last_obstacle_x - obs_x1
@@ -1222,20 +1445,30 @@ class CookieRunAIApp(tk.Tk):
         else:
             self.last_obstacle_x = None
             self.last_obstacle_time = None
+            self.last_closest_dist = 0
+            self.current_jitter = 0.0
 
-        # คำนวณระยะทริกเกอร์แบบปรับความเร็วอัตโนมัติ (เทียบกับความเร็วปกติ 350 px/s)
+        # คำนวณ TTC (Time-To-Collision) threshold จาก trigger_dist และความเร็วปัจจุบัน
+        # แปลงระยะ trigger_dist (px) เป็นเวลา (วินาที) — ทำให้ timing คงที่ไม่ว่าจะวิ่งเร็วแค่ไหน
         normal_speed = 350.0
         speed_factor = self.estimated_speed / normal_speed
-        dynamic_trigger_dist = self.trigger_dist * speed_factor
-        # จำกัดระยะทริกเกอร์ให้อยู่ในช่วงปลอดภัย
-        dynamic_trigger_dist = max(80.0, min(dynamic_trigger_dist, 350.0))
+        
+        # Anti-Detection: คำนวณความล้าสะสม (Fatigue) ยิ่งเล่นไปหลายรอบการตัดสินใจยิ่งช้าลงเล็กน้อย (ลด TTC ลง)
+        max_runs = max(1, self.target_session_runs)
+        fatigue_ratio = min(self.current_session_runs / max_runs, 1.0)
+        fatigue_delay = fatigue_ratio * random.uniform(0.02, 0.06) # หน่วงปฏิกิริยาช้าลง 20-60ms ตามรอบเซสชัน
+        
+        trigger_ttc = (self.trigger_dist / max(self.estimated_speed, 1.0)) + self.current_jitter - fatigue_delay
+        # จำกัด TTC ให้อยู่ในช่วงปลอดภัย (0.12 ถึง 0.80 วินาที)
+        trigger_ttc = max(0.12, min(trigger_ttc, 0.80))
 
         # ดีบักความเร็วทุกๆ 1 วินาที
         if not hasattr(self, "last_speed_print_time"):
             self.last_speed_print_time = 0
         if now - self.last_speed_print_time > 1.0:
             self.last_speed_print_time = now
-            print(f"📊 Speed: {self.estimated_speed:.1f} px/s | Trigger Dist: {dynamic_trigger_dist:.1f} px (Base: {self.trigger_dist})")
+            print(f"📊 Speed: {self.estimated_speed:.1f} px/s | TTC Trigger: {trigger_ttc:.3f}s (Base Dist: {self.trigger_dist}px)")
+            self.speed_label.configure(text=f"Speed: {self.estimated_speed:.0f} px/s  |  TTC: {trigger_ttc:.3f}s")
 
         if closest_obstacle_info is not None:
             obs_x1, obs_y1, obs_x2, obs_y2, obs_name, dist = closest_obstacle_info
@@ -1243,7 +1476,10 @@ class CookieRunAIApp(tk.Tk):
             cookie_center_y = cookie_box[1] + int((cookie_box[3]-cookie_box[1])/2) if cookie_box else 250
             obs_center_y = obs_y1 + int((obs_y2-obs_y1)/2)
 
-            if dist <= dynamic_trigger_dist:
+            # คำนวณ TTC ของสิ่งกีดขวางที่ใกล้ที่สุด (เวลาที่เหลือก่อนชน)
+            obs_ttc = dist / max(self.estimated_speed, 1.0)
+
+            if obs_ttc <= trigger_ttc:
                 if obs_name in ["jump_obs", "jump_potato", "double_jump_obs", "raised_floor", "coin"]:
                     is_double_jump = False
                     if obs_name == "double_jump_obs":
@@ -1251,8 +1487,10 @@ class CookieRunAIApp(tk.Tk):
                     elif len(jump_obstacles) >= 2:
                         first_obs = jump_obstacles[0]
                         second_obs = jump_obstacles[1]
-                        gap = second_obs[0] - first_obs[1]
-                        if gap < 130:
+                        gap_px = second_obs[0] - first_obs[1]
+                        # แปลง gap เป็นเวลา — ถ้าห่างกันไม่ถึง 0.35 วินาที ถือว่าต้อง double jump
+                        gap_time = gap_px / max(self.estimated_speed, 1.0)
+                        if gap_time < 0.35:
                             is_double_jump = True
                             
                     if is_double_jump:
@@ -1262,6 +1500,25 @@ class CookieRunAIApp(tk.Tk):
                         
                 elif obs_name == "slide_obs":
                     found_slide_obstacle = True
+
+        # Anti-Detection: จำลอง Junk Inputs (กดปุ่มกระโดด/สไลด์เล่นแก้เบื่อ เลียนแบบมนุษย์)
+        # เงื่อนไข: ไม่เจอสิ่งกีดขวางระยะประชิด (dist > 280px) หรือไม่มีอุปสรรคอยู่เลย และไม่ได้กดค้างปุ่มใดๆ
+        if not (found_jump_obstacle or found_double_jump_obstacle or found_slide_obstacle):
+            if closest_obstacle_info is None or closest_obstacle_distance > 280:
+                # สุ่มแตะจังหวะว่างทุกๆ 12 ถึง 25 วินาที
+                if now - self.last_junk_input_time > random.uniform(12.0, 25.0):
+                    self.last_junk_input_time = now
+                    junk_type = random.choice(["JUMP", "DOUBLE_JUMP", "SLIDE"])
+                    
+                    if junk_type == "JUMP" and now - self.last_jump_time > 1.5:
+                        found_jump_obstacle = True
+                        print(f"[{time.strftime('%H:%M:%S')}] 🤪 Anti-Detection: แอบกดกระโดดเปล่าเลียนแบบผู้เล่นจริง")
+                    elif junk_type == "DOUBLE_JUMP" and now - self.last_jump_time > 1.8:
+                        found_double_jump_obstacle = True
+                        print(f"[{time.strftime('%H:%M:%S')}] 🤪 Anti-Detection: แอบกดดับเบิ้ลจัมพ์เล่นเลียนแบบผู้เล่นจริง")
+                    elif junk_type == "SLIDE" and now - self.last_slide_time > 1.5:
+                        found_slide_obstacle = True
+                        print(f"[{time.strftime('%H:%M:%S')}] 🤪 Anti-Detection: แอบกดหมอบสไลด์สั้นเลียนแบบผู้เล่นจริง")
 
         # Cliff detection (ระบบแสกนขอบเหว)
         ground_boxes = []
@@ -1274,11 +1531,10 @@ class CookieRunAIApp(tk.Tk):
             if x1 <= 220 and x2 >= 180:
                 # คำนวณระยะห่างเหวโดยอิงจากตำแหน่งจุดเริ่มกระโดด 220 ป้องกันพิกัดเหวแกว่งตอนคุกกี้ลอยตัว
                 dist_to_cliff = x2 - 220
-                # ขยายระยะการวัดเหวอัตโนมัติตามความเร็ววิ่งของตัวละคร
-                dynamic_cliff_dist = 130.0 * speed_factor
-                dynamic_cliff_dist = max(80.0, min(dynamic_cliff_dist, 250.0))
-                
-                if 10 < dist_to_cliff <= dynamic_cliff_dist:
+                # แปลงระยะเหวเป็น TTC เพื่อให้สอดคล้องกับระบบทริกเกอร์หลัก
+                cliff_ttc = dist_to_cliff / max(self.estimated_speed, 1.0)
+                # ทริกเกอร์กระโดดเมื่อเหวเหลือ 0.03 ถึง 0.45 วินาที
+                if 0.03 < cliff_ttc <= 0.45:
                     has_continuation = False
                     for nx1, nx2, ny1, ny2 in ground_boxes:
                         if 0 <= (nx1 - x2) < 45:
@@ -1287,11 +1543,11 @@ class CookieRunAIApp(tk.Tk):
                     for rx1, ry1, rx2, ry2, rc_name, rconf in detected_objects:
                         if rc_name == "raised_floor":
                             if 0 <= (rx1 - x2) < 45:
-                                            has_continuation = True
-                                            break
+                                has_continuation = True
+                                break
                     if not has_continuation:
                         found_jump_obstacle = True
-                        print(f"[{time.strftime('%H:%M:%S')}] เรดาร์เตือน: ตรวจพบขอบเหวห่างออกไป {int(dist_to_cliff)}px -> สั่งกระโดดหลบเหว!")
+                        # print(f"[{time.strftime('%H:%M:%S')}] เรดาร์เตือน: ตรวจพบขอบเหวห่างออกไป {int(dist_to_cliff)}px -> สั่งกระโดดหลบเหว!")
                         break
 
         # Background keyboard control inputs
@@ -1308,10 +1564,10 @@ class CookieRunAIApp(tk.Tk):
             current_status = "SWITCH_COOKIE"
             print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> เปลี่ยนตัว Alt")
             
-            # 1. ส่งสัญญาณคีย์บอร์ด Alt (แบบเดิม)
+            # 1. ส่งสัญญาณคีย์บอร์ด Alt ครั้งแรกทันที ครั้งที่ 2 จองคิวแบบ non-blocking
             human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
-            time.sleep(random.uniform(0.06, 0.10))
-            human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08)
+            delay_ms = int(random.uniform(60, 100))
+            self.after(delay_ms, lambda: human_press_bg(self.hwnd, VK_ALT, SCAN_ALT, duration_min=0.05, duration_max=0.08))
             
             # 2. ส่งสัญญาณคลิกเมาส์เสมือนตรงไปที่ปุ่มบนจอ
             if self.cached_switch_rect is not None:
@@ -1325,7 +1581,7 @@ class CookieRunAIApp(tk.Tk):
         
         elif found_double_jump_obstacle and now - self.last_jump_time > 0.50:
             current_status = "DOUBLE_JUMP"
-            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> ดับเบิ้ลจัมพ์ (Non-Blocking)")
+            # print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> ดับเบิ้ลจัมพ์ (Non-Blocking)")
             self.force_release_key(VK_SPACE, SCAN_SPACE)
             
             win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, lParam_shift_down)
@@ -1341,7 +1597,7 @@ class CookieRunAIApp(tk.Tk):
             
         elif found_jump_obstacle and now - self.last_jump_time > 0.40:
             current_status = "JUMPING"
-            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> กระโดด (Non-Blocking)")
+            # print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> กระโดด (Non-Blocking)")
             self.force_release_key(VK_SPACE, SCAN_SPACE)
             
             win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_LSHIFT, lParam_shift_down)
@@ -1353,7 +1609,7 @@ class CookieRunAIApp(tk.Tk):
             
         elif found_slide_obstacle and now - self.last_slide_time > 0.35:
             current_status = "SLIDING"
-            print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> หมอบสไลด์ (Non-Blocking)")
+            # print(f"[{time.strftime('%H:%M:%S')}] เบื้องหลัง -> หมอบสไลด์ (Non-Blocking)")
             self.force_release_key(VK_LSHIFT, SCAN_SHIFT)
             
             win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, VK_SPACE, lParam_space_down)
